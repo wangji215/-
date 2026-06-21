@@ -136,16 +136,20 @@ def _persist_bars(df: pd.DataFrame) -> int:
     if df is None or df.empty:
         return 0
     cols = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount", "pct_chg"]
-    rows = []
-    for _, r in df.iterrows():
-        rows.append({c: r.get(c) for c in cols})
-    stmt = sqlite_insert(DailyBar.__table__).values(rows)
-    update_cols = {c: stmt.excluded[c] for c in cols if c not in ("ts_code", "trade_date")}
-    stmt = stmt.on_conflict_do_update(index_elements=["ts_code", "trade_date"], set_=update_cols)
+    rows = [{c: r.get(c) for c in cols} for _, r in df.iterrows()]
+    # SQLite 单条语句变量数默认上限 999；9 列 × 每批 100 行 = 900，留出余量，
+    # 否则整市场单日约 5000+ 只股票会触发 too many SQL variables。
+    BATCH = 100
+    total = len(rows)
     with get_session() as s:
-        s.execute(stmt)
+        for i in range(0, total, BATCH):
+            batch = rows[i:i + BATCH]
+            stmt = sqlite_insert(DailyBar.__table__).values(batch)
+            update_cols = {c: stmt.excluded[c] for c in cols if c not in ("ts_code", "trade_date")}
+            stmt = stmt.on_conflict_do_update(index_elements=["ts_code", "trade_date"], set_=update_cols)
+            s.execute(stmt)
         s.commit()
-    return len(rows)
+    return total
 
 
 def _cached_trade_dates() -> set:
