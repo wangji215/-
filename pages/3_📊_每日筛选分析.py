@@ -68,7 +68,7 @@ def _render_match(m: Match, lookback_dates: list[str], tracked: bool, name: str 
             st.plotly_chart(_kline_fig(m.ts_code, lookback_dates, header), use_container_width=True)
         with tc2:
             if not tracked:
-                st.caption("未跟踪 — 在上方表格勾选并点「📊 交易日分析」开始跟踪")
+                st.caption("未跟踪 — 点上方「📊 交易日分析」开启购入价/交易日跟踪")
                 return
             # 已跟踪：买入价录入 + 跟踪表
             df = backtest.tracking_df(m.id)
@@ -185,8 +185,13 @@ with tab_run:
                     else:
                         st.warning("请先在表中勾选至少一只股票。")
 
-                # 逐只详情：K线始终显示；已跟踪才显跟踪表 + 买入价表单
-                for m in matches:
+                # 逐只详情：不自动分析每只——仅「已跟踪」或「当前勾选(预览)」的股票
+                # 才显示K线/跟踪；其余只作筛选行展示。
+                checked_codes = set(edited.loc[edited["选择"], "代码"].tolist())
+                detail_matches = [m for m in matches if (m.id in tracked) or (m.ts_code in checked_codes)]
+                if detail_matches:
+                    st.caption("已跟踪 / 已勾选的股票详情（其余仅作筛选展示，不自动分析）：")
+                for m in detail_matches:
                     _render_match(m, lookback_dates, m.id in tracked, name_map.get(m.ts_code, ""))
 
 # ---------------- Tab 2: 历史运行 ----------------
