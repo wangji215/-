@@ -14,6 +14,7 @@ from openai import OpenAI
 from core.config import apply_proxies, get_setting
 from core.strategy_dsl import StrategyDSL
 from core.strategy_prompt import build_messages
+from core.strategy_ref import build_sample_reference
 
 
 class LLMError(RuntimeError):
@@ -60,14 +61,18 @@ def test_connection(prompt: str = "请回复：连接正常") -> dict:
         return {"ok": False, "reply": "", "error": str(e)}
 
 
-def generate_strategy(dialog_history: list[dict]) -> tuple[str, Optional[StrategyDSL], Optional[str]]:
+def generate_strategy(dialog_history: list[dict],
+                      sample_codes: Optional[list[str]] = None) -> tuple[str, Optional[StrategyDSL], Optional[str]]:
     """根据对话历史生成策略。
 
     返回 (raw_text, dsl_or_None, error_or_None)。
     若大模型在追问/澄清（未产出合法 JSON），dsl 为 None 且 error 为 None。
     若产出非法 JSON，error 给出原因。
+
+    sample_codes 非空时，先构建样本股参考文本注入 prompt，使策略贴合真实样本。
     """
-    messages = build_messages(dialog_history)
+    reference = build_sample_reference(sample_codes) if sample_codes else None
+    messages = build_messages(dialog_history, reference)
     raw = chat(messages)
     obj, err = _extract_json(raw)
     if err:

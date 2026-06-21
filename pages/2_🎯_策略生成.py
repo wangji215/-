@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import re
 
 import streamlit as st
 
 from core import llm_client, strategy_repo
+from core import strategy_ref
 from core.strategy_dsl import StrategyDSL, dsl_to_text
 
 st.set_page_config(page_title="策略生成", page_icon="🎯", layout="wide")
@@ -18,6 +20,8 @@ if "pending_dsl" not in st.session_state:
     st.session_state.pending_dsl = None
 if "pending_raw" not in st.session_state:
     st.session_state.pending_raw = ""
+if "last_reference" not in st.session_state:
+    st.session_state.last_reference = None
 
 left, right = st.columns([3, 2])
 
@@ -25,6 +29,16 @@ left, right = st.columns([3, 2])
 with left:
     st.subheader("对话生成")
     st.caption("描述你想要的 K 线图形策略，模型会产出可执行 DSL。需求不清时会先追问。")
+
+    # 参考样本股（可选）：填写后生成会参考其近期 K 线指标，使策略更贴合真实形态
+    st.text_input(
+        "参考样本股（可选，逗号分隔，如 600519,300750,贵州茅台）",
+        key="sample_codes_input",
+        placeholder="留空则不注入参考；填写后，系统取其近期指标注入 prompt",
+    )
+    if st.session_state.get("last_reference"):
+        with st.expander("本次注入的参考数据", expanded=False):
+            st.text(st.session_state.last_reference)
 
     # 历史回放
     for msg in st.session_state.dlg:
@@ -65,12 +79,17 @@ with left:
 
     user_input = st.chat_input("描述你的图形策略，例如：均线多头排列且MACD金叉...")
     if user_input:
+        # 解析参考样本股（支持中英文逗号/空格/分号分隔）
+        raw_codes = [c for c in re.split(r"[,\s，;；]+", st.session_state.get("sample_codes_input", "")) if c.strip()]
+        st.session_state.last_reference = strategy_ref.build_sample_reference(raw_codes) if raw_codes else None
         st.session_state.dlg.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
         with st.chat_message("assistant"):
             with st.spinner("模型思考中..."):
-                raw, dsl, err = llm_client.generate_strategy(st.session_state.dlg)
+                raw, dsl, err = llm_client.generate_strategy(
+                    st.session_state.dlg, sample_codes=raw_codes or None
+                )
         # 记录助手回复（若有 DSL，回放里展示可读说明而非裸 JSON）
         if dsl is not None:
             st.session_state.dlg.append({"role": "assistant", "content": dsl_to_text(dsl)})
