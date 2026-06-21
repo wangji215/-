@@ -51,20 +51,25 @@ def run_analysis(strategy_id: int, snapshot_date: str, persist: bool = True) -> 
     )
 
     try:
+        # 数据准备：所有 tushare 取数 / 写缓存必须在 analysis_runs 事务之外完成。
+        # 否则 SQLite 在已持有写锁的事务内，再开新连接写 trade_cal / daily_bars
+        # 会触发 "database is locked"（同线程自死锁）。
         lookback_dates = tushare_api.get_lookback_dates(snapshot_date, dsl.lookback)
         tushare_api.ensure_bars_for_dates(lookback_dates)
         bars = tushare_api.load_bars(lookback_dates)
         matched_codes = strategy_engine.evaluate(dsl, bars, snapshot_date)
         run.matched_count = len(matched_codes)
 
+        # 预取后续交易日，保证 T+0..T+5 收盘可填（同样在事务外抓取）
+        track_days = future_trade_days(snapshot_date)
+        tushare_api.ensure_bars_for_dates(track_days)
+        track_bars = tushare_api.load_bars(track_days)
+
         if persist:
+            # 落库阶段：仅做 INSERT（run / matches / trackings），单事务提交。
             with get_session() as s:
                 s.add(run)
                 s.flush()
-                # 预取后续交易日，保证 T+0..T+5 收盘可填
-                track_days = future_trade_days(snapshot_date)
-                tushare_api.ensure_bars_for_dates(track_days)
-                track_bars = tushare_api.load_bars(track_days)
                 for code in matched_codes:
                     m = Match(
                         run_id=run.id,
@@ -78,13 +83,25 @@ def run_analysis(strategy_id: int, snapshot_date: str, persist: bool = True) -> 
                 s.commit()
                 s.refresh(run)
     except Exception as e:  # noqa: BLE001
+        # 记录失败：必须新建对象写入 failed 记录。切勿复用可能已被 flush 过
+        # （带 id 但事务已回滚）的 run，否则会发 UPDATE 匹配 0 行 → StaleDataError，
+        # 反而掩盖真实错误。
         run.status = "failed"
         run.message = str(e)
         if persist:
-            with get_session() as s:
-                s.add(run)
-                s.commit()
-                s.refresh(run)
+            try:
+                with get_session() as s:
+                    s.add(AnalysisRun(
+                        strategy_id=strategy_id,
+                        run_date=today,
+                        snapshot_date=snapshot_date,
+                        matched_count=run.matched_count,
+                        status="failed",
+                        message=str(e),
+                    ))
+                    s.commit()
+            except Exception:  # noqa: BLE001
+                pass  # 记录失败本身出错也不能掩盖原始错误
         raise
 
     return run
@@ -108,29 +125,36 @@ def _ensure_trackings(s: Session, match_id: int, ts_code: str, strategy_id: int,
 
 def fill_and_recompute(match_id: Optional[int] = None) -> int:
     """补齐已到交易日的收盘价并重算涨跌。返回处理的 match 数。"""
+    # 1) 读：取待处理的 match 与需要补收盘价的 (ts_code, trade_date)。
     with get_session() as s:
-        q = s.query(Tracking)
         if match_id is not None:
             match_ids = [match_id]
         else:
             match_ids = [r[0] for r in s.query(Tracking.match_id).distinct().all()]
-        # 需要补数据的 (ts_code, trade_date)
         pending = (
             s.query(Tracking.ts_code, Tracking.trade_date)
             .filter(Tracking.close.is_(None))
             .all()
         )
-        if pending:
-            dates = sorted({d for _, d in pending})
-            tushare_api.ensure_bars_for_dates(dates)
-            bars = tushare_api.load_bars(dates)
-            for ts_code, td in pending:
-                c = _snapshot_close(bars, ts_code, td)
-                if c is not None:
-                    s.query(Tracking).filter(
-                        Tracking.ts_code == ts_code, Tracking.trade_date == td, Tracking.close.is_(None)
-                    ).update({Tracking.close: c}, synchronize_session=False)
-            s.flush()
+
+    # 2) 事务外抓取并缓存日 K：ensure_bars_for_dates 会写 daily_bars，
+    #    不能嵌套在下面的写事务内，否则同样 "database is locked"。
+    closes = {}
+    if pending:
+        dates = sorted({d for _, d in pending})
+        tushare_api.ensure_bars_for_dates(dates)
+        bars = tushare_api.load_bars(dates)
+        for ts_code, td in pending:
+            closes[(ts_code, td)] = _snapshot_close(bars, ts_code, td)
+
+    # 3) 写：回填 close 并重算涨跌。
+    with get_session() as s:
+        for (ts_code, td), c in closes.items():
+            if c is not None:
+                s.query(Tracking).filter(
+                    Tracking.ts_code == ts_code, Tracking.trade_date == td, Tracking.close.is_(None)
+                ).update({Tracking.close: c}, synchronize_session=False)
+        s.flush()
         for mid in match_ids:
             _recompute_match(s, mid)
         s.commit()
