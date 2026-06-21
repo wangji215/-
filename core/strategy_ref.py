@@ -175,15 +175,24 @@ def _ret_n(close: pd.Series, n: int) -> float:
 
 
 def _last_bar_patterns(df: pd.DataFrame) -> str:
+    # doji/hammer/engulfing 内部对 high==low 的一字板会用 pd.NA，导致
+    # `bool(NA)` ambiguous 报错；这里把每个形态单独包起来，异常/NA 一律视为未命中。
     checks = [
-        ("十字星", indicators.doji(df)),
-        ("锤子线", indicators.hammer(df)),
-        ("阳包阴", indicators.engulfing_bull(df)),
-        ("阴包阳", indicators.engulfing_bear(df)),
-        ("三连阳", indicators.consecutive_up(df, 3)),
-        ("三连阴", indicators.consecutive_down(df, 3)),
+        ("十字星", lambda: indicators.doji(df)),
+        ("锤子线", lambda: indicators.hammer(df)),
+        ("阳包阴", lambda: indicators.engulfing_bull(df)),
+        ("阴包阳", lambda: indicators.engulfing_bear(df)),
+        ("三连阳", lambda: indicators.consecutive_up(df, 3)),
+        ("三连阴", lambda: indicators.consecutive_down(df, 3)),
     ]
-    hit = [name for name, s in checks if bool(s.fillna(False).iloc[-1])]
+    hit = []
+    for name, fn in checks:
+        try:
+            val = fn().fillna(False).iloc[-1]
+            if bool(val):
+                hit.append(name)
+        except Exception:  # noqa: BLE001  NA/计算异常 → 该形态未命中
+            continue
     return "、".join(hit)
 
 
