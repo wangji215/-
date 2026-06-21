@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -22,6 +23,15 @@ def _stock_name(ts_code: str) -> str:
     with get_session() as s:
         row = s.query(Stock).filter_by(ts_code=ts_code).first()
         return row.name if row else ""
+
+
+def _name_map(ts_codes: list[str]) -> dict:
+    """批量解析 ts_code → 名称，避免逐只开 session。"""
+    if not ts_codes:
+        return {}
+    with get_session() as s:
+        rows = s.query(Stock).filter(Stock.ts_code.in_(ts_codes)).all()
+    return {r.ts_code: r.name for r in rows}
 
 
 def _kline_fig(ts_code: str, trade_dates: list[str], title: str) -> go.Figure:
@@ -48,15 +58,19 @@ def _kline_fig(ts_code: str, trade_dates: list[str], title: str) -> go.Figure:
     return fig
 
 
-def _render_match(m: Match, lookback_dates: list[str]) -> None:
-    name = _stock_name(m.ts_code)
+def _render_match(m: Match, lookback_dates: list[str], tracked: bool, name: str = "") -> None:
+    if not name:
+        name = _stock_name(m.ts_code)
     header = f"{m.ts_code}  {name}"
     with st.expander(header):
         tc1, tc2 = st.columns([2, 3])
         with tc1:
             st.plotly_chart(_kline_fig(m.ts_code, lookback_dates, header), use_container_width=True)
         with tc2:
-            # 买入价录入 + 跟踪表
+            if not tracked:
+                st.caption("未跟踪 — 在上方表格勾选并点「📊 交易日分析」开始跟踪")
+                return
+            # 已跟踪：买入价录入 + 跟踪表
             df = backtest.tracking_df(m.id)
             st.markdown("**5 交易日跟踪**")
             show = df.rename(columns={
@@ -130,31 +144,67 @@ with tab_run:
             if not matches:
                 st.caption("无匹配股票。")
             else:
+                # 名称 / 策略名批量解析；已跟踪集合；代码→match_id 映射
+                name_map = _name_map([m.ts_code for m in matches])
+                strat_map = {s.id: s.name for s in strategy_repo.list_strategies()}
+                tracked = backtest.tracked_match_ids(run_id)
+                code_to_mid = {m.ts_code: m.id for m in matches}
+
                 dsl = strategy_repo.get_current_dsl(strategy_id) if strategy_id else None
                 lookback = dsl.lookback if dsl else 30
                 lookback_dates = tushare_api.get_lookback_dates(matches[0].snapshot_date, lookback)
-                # 概览表
-                overview = [{"代码": m.ts_code, "名称": _stock_name(m.ts_code)} for m in matches]
-                st.dataframe(overview, hide_index=True, use_container_width=True)
+
+                # 概览（可勾选）+ 交易日分析按钮
+                ov = pd.DataFrame([
+                    {
+                        "选择": False,
+                        "代码": m.ts_code,
+                        "名称": name_map.get(m.ts_code, ""),
+                        "匹配策略": strat_map.get(m.strategy_id, str(m.strategy_id) if m.strategy_id else ""),
+                        "状态": "已跟踪" if m.id in tracked else "未跟踪",
+                    }
+                    for m in matches
+                ])
+                edited = st.data_editor(
+                    ov,
+                    column_config={"选择": st.column_config.CheckboxColumn("勾选跟踪", default=False)},
+                    disabled=[c for c in ov.columns if c != "选择"],
+                    hide_index=True,
+                    key=f"sel_{run_id}",
+                    use_container_width=True,
+                )
+                _, btn_col = st.columns([4, 1])
+                if btn_col.button("📊 交易日分析", type="primary",
+                                  help="对勾选的股票开启购入价/交易日跟踪（T+0..T+5）"):
+                    sel_codes = edited.loc[edited["选择"], "代码"].tolist()
+                    sel_ids = [code_to_mid[c] for c in sel_codes if c in code_to_mid]
+                    if sel_ids:
+                        n = backtest.start_tracking(run_id, sel_ids)
+                        st.toast(f"已对 {n} 只开启跟踪")
+                        st.rerun()
+                    else:
+                        st.warning("请先在表中勾选至少一只股票。")
+
+                # 逐只详情：K线始终显示；已跟踪才显跟踪表 + 买入价表单
                 for m in matches:
-                    _render_match(m, lookback_dates)
+                    _render_match(m, lookback_dates, m.id in tracked, name_map.get(m.ts_code, ""))
 
 # ---------------- Tab 2: 历史运行 ----------------
 with tab_history:
+    strat_map = {s.id: s.name for s in strategy_repo.list_strategies()}
     with get_session() as s:
         runs = s.query(AnalysisRun).order_by(AnalysisRun.id.desc()).limit(50).all()
         data = [
             {
-                "run": r.id, "策略ID": r.strategy_id, "分析交易日": r.snapshot_date,
-                "匹配数": r.matched_count, "状态": r.status, "运行于": r.created_at,
+                "run": r.id, "策略": strat_map.get(r.strategy_id, str(r.strategy_id) if r.strategy_id else ""),
+                "分析交易日": r.snapshot_date, "匹配数": r.matched_count,
+                "状态": r.status, "运行于": r.created_at,
             }
             for r in runs
         ]
     if not data:
         st.info("还没有运行记录。")
     else:
-        import pandas as pd
-
         st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
         chosen = st.number_input("查看 run 编号", min_value=1, value=data[0]["run"], step=1)
         if st.button("加载该 run 的匹配与跟踪"):
@@ -163,11 +213,10 @@ with tab_history:
 
 # ---------------- Tab 3: 归档 ----------------
 with tab_archive:
-    df = backtest.archived_by_buy_date()
+    df = backtest.archive_summary()
     if df.empty:
-        st.info("还没有录入买入价的记录。运行分析并在匹配结果里填入「当日购入价格」后，这里按购买日期归档展示。")
+        st.info("还没有跟踪记录——运行分析后，在匹配结果里勾选股票并点「📊 交易日分析」，这里按购入日期 + 策略归档展示。")
     else:
-        for buy_date, group in df.groupby("buy_date"):
+        for buy_date, group in df.groupby("购入日期"):
             with st.expander(f"📅 {buy_date}  ·  {len(group)} 只"):
-                g = group.drop(columns=["buy_date"])
-                st.dataframe(g, hide_index=True, use_container_width=True)
+                st.dataframe(group.drop(columns=["购入日期"]), hide_index=True, use_container_width=True)

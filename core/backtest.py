@@ -1,6 +1,7 @@
 """每日分析与 5 交易日跟踪服务。
 
-- :func:`run_analysis` ：对一条策略在某 snapshot_date 跑引擎，落 AnalysisRun + Matches + Tracking(T+0..T+5)。
+- :func:`run_analysis` ：对一条策略在某 snapshot_date 跑引擎，落 AnalysisRun + Matches（**只筛选**，不自动跟踪）。
+- :func:`start_tracking` ：对勾选的 match 开启 opt-in 跟踪（T+0..T+5）。
 - :func:`fill_and_recompute` ：补齐已到交易日的收盘价并重算涨跌（懒计算）。
 - :func:`update_buy_price` ：录入买入价后重算。
 """
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from core import strategy_engine, strategy_repo, tushare_api
 from core.db import get_session
-from core.models import AnalysisRun, Match, Tracking
+from core.models import AnalysisRun, Match, Strategy, Stock, Tracking
 
 TRACK_DAYS = 5  # 跟踪后 5 个交易日
 
@@ -60,26 +61,19 @@ def run_analysis(strategy_id: int, snapshot_date: str, persist: bool = True) -> 
         matched_codes = strategy_engine.evaluate(dsl, bars, snapshot_date)
         run.matched_count = len(matched_codes)
 
-        # 预取后续交易日，保证 T+0..T+5 收盘可填（同样在事务外抓取）
-        track_days = future_trade_days(snapshot_date)
-        tushare_api.ensure_bars_for_dates(track_days)
-        track_bars = tushare_api.load_bars(track_days)
-
         if persist:
-            # 落库阶段：仅做 INSERT（run / matches / trackings），单事务提交。
+            # 落库阶段：仅做 INSERT（run / matches）。跟踪(Tracking)改为按需 opt-in
+            # （见 start_tracking）——运行分析不再对每只命中股自动建跟踪。
             with get_session() as s:
                 s.add(run)
                 s.flush()
                 for code in matched_codes:
-                    m = Match(
+                    s.add(Match(
                         run_id=run.id,
                         ts_code=code,
                         strategy_id=strategy_id,
                         snapshot_date=snapshot_date,
-                    )
-                    s.add(m)
-                    s.flush()
-                    _ensure_trackings(s, m.id, code, strategy_id, snapshot_date, track_bars)
+                    ))
                 s.commit()
                 s.refresh(run)
     except Exception as e:  # noqa: BLE001
@@ -121,6 +115,50 @@ def _ensure_trackings(s: Session, match_id: int, ts_code: str, strategy_id: int,
             buy_price=None, buy_date=snapshot_date, offset=offset,
             trade_date=td, close=close, day_pct=None, cum_pct=None,
         ))
+
+
+def start_tracking(run_id: int, match_ids: List[int]) -> int:
+    """对勾选的 match 开启 opt-in 跟踪：建 T+0..T+5 跟踪行并尽量填已到交易日收盘。
+
+    ``run_analysis`` 现仅筛选不自动跟踪；用户在界面勾选后调用本函数。
+    幂等：已存在的 offset 由 ``_ensure_trackings`` 跳过。返回实际处理的 match 数。
+    """
+    if not match_ids:
+        return 0
+    with get_session() as s:
+        rows = (
+            s.query(Match)
+            .filter(Match.id.in_(match_ids), Match.run_id == run_id)
+            .all()
+        )
+        if not rows:
+            return 0
+        snap = rows[0].snapshot_date
+        targets = [(r.id, r.ts_code, r.strategy_id) for r in rows]
+
+    # 事务外抓取未来交易日 K（写 daily_bars 不能嵌套在下面写事务内，否则 database is locked）
+    track_days = future_trade_days(snap)
+    tushare_api.ensure_bars_for_dates(track_days)
+    track_bars = tushare_api.load_bars(track_days)
+
+    with get_session() as s:
+        for mid, code, sid in targets:
+            _ensure_trackings(s, mid, code, sid, snap, track_bars)
+        s.commit()
+    return len(targets)
+
+
+def tracked_match_ids(run_id: int) -> set:
+    """返回该 run 中已有 Tracking 行的 match_id 集合（供 UI 标注「已跟踪」）。"""
+    with get_session() as s:
+        rows = (
+            s.query(Tracking.match_id)
+            .join(Match, Match.id == Tracking.match_id)
+            .filter(Match.run_id == run_id)
+            .distinct()
+            .all()
+        )
+    return {r[0] for r in rows}
 
 
 def fill_and_recompute(match_id: Optional[int] = None) -> int:
@@ -212,31 +250,38 @@ def tracking_df(match_id: int) -> pd.DataFrame:
     ])
 
 
-def archived_by_buy_date() -> pd.DataFrame:
-    """按买入日期归档：返回每个 (buy_date, ts_code, strategy_id) 的跟踪摘要。
+def archive_summary() -> pd.DataFrame:
+    """已跟踪股票归档摘要：按购入日期(=snapshot_date)排序，含名称/策略名/买入价/T0收盘/T+1..T+5累计。
 
-    每行含 buy_date, ts_code, buy_price, 各 offset 的 cum_pct。
+    展示**全部已跟踪**记录（买入价未填亦列出）。每行对应一个 (buy_date, ts_code, strategy_id)。
     """
     with get_session() as s:
         rows = (
             s.query(Tracking)
-            .filter(Tracking.buy_price.is_not(None))
             .order_by(Tracking.buy_date.desc(), Tracking.ts_code, Tracking.offset)
             .all()
         )
-    if not rows:
-        return pd.DataFrame()
+        if not rows:
+            return pd.DataFrame()
+        # 批量解析名称 / 策略名，避免逐行查询
+        codes = {r.ts_code for r in rows}
+        sids = {r.strategy_id for r in rows if r.strategy_id is not None}
+        name_by_code = {r.ts_code: r.name for r in s.query(Stock).filter(Stock.ts_code.in_(codes)).all()}
+        name_by_sid = {r.id: r.name for r in s.query(Strategy).filter(Strategy.id.in_(sids)).all()}
+
     records = {}
     for r in rows:
         key = (r.buy_date, r.ts_code, r.strategy_id)
         rec = records.setdefault(
             key,
-            {"buy_date": r.buy_date, "ts_code": r.ts_code, "strategy_id": r.strategy_id,
-             "buy_price": r.buy_price, "T0_close": None,
-             **{f"T+{i}_cum%": None for i in range(1, TRACK_DAYS + 1)}},
+            {"购入日期": r.buy_date, "代码": r.ts_code,
+             "名称": name_by_code.get(r.ts_code, ""),
+             "策略": name_by_sid.get(r.strategy_id, str(r.strategy_id)) if r.strategy_id is not None else "",
+             "买入价": r.buy_price, "T0收盘": None,
+             **{f"T+{i}累计%": None for i in range(1, TRACK_DAYS + 1)}},
         )
         if r.offset == 0:
-            rec["T0_close"] = r.close
+            rec["T0收盘"] = r.close
         else:
-            rec[f"T+{r.offset}_cum%"] = r.cum_pct
+            rec[f"T+{r.offset}累计%"] = r.cum_pct
     return pd.DataFrame(list(records.values()))
