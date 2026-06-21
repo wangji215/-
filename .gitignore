@@ -17,6 +17,7 @@ env/
 # Local data / secrets
 data/*.db
 data/*.db-journal
+data/*.log
 .env
 
 # IDE / OS

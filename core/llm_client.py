@@ -62,7 +62,11 @@ def test_connection(prompt: str = "请回复：连接正常") -> dict:
 
 
 def generate_strategy(dialog_history: list[dict],
-                      sample_codes: Optional[list[str]] = None) -> tuple[str, Optional[StrategyDSL], Optional[str]]:
+                      sample_codes: Optional[list[str]] = None,
+                      ref_start: Optional[str] = None,
+                      ref_end: Optional[str] = None,
+                      ref_buy: Optional[str] = None
+                      ) -> tuple[str, Optional[StrategyDSL], Optional[str]]:
     """根据对话历史生成策略。
 
     返回 (raw_text, dsl_or_None, error_or_None)。
@@ -70,8 +74,13 @@ def generate_strategy(dialog_history: list[dict],
     若产出非法 JSON，error 给出原因。
 
     sample_codes 非空时，先构建样本股参考文本注入 prompt，使策略贴合真实样本。
+    ref_start/ref_end/ref_buy（YYYYMMDD）给出时进入「窗口+买点」模式：以买点当日为目标态、
+    窗口走势作校准，供模型以标注样本优化策略。
     """
-    reference = build_sample_reference(sample_codes) if sample_codes else None
+    reference = (
+        build_sample_reference(sample_codes, start=ref_start, end=ref_end, buy_date=ref_buy)
+        if sample_codes else None
+    )
     messages = build_messages(dialog_history, reference)
     raw = chat(messages)
     obj, err = _extract_json(raw)
