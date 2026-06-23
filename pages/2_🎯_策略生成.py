@@ -9,6 +9,7 @@ import streamlit as st
 
 from core import llm_client, strategy_repo, tushare_api
 from core import strategy_ref
+from core.strategy_draft import StrategyGenerationResult
 from core.strategy_dsl import StrategyDSL, dsl_to_text
 
 st.set_page_config(page_title="策略生成", page_icon="🎯", layout="wide")
@@ -19,6 +20,10 @@ if "dlg" not in st.session_state:
     st.session_state.dlg = []  # [{"role":"user"/"assistant","content":...}]
 if "pending_dsl" not in st.session_state:
     st.session_state.pending_dsl = None
+if "pending_generation" not in st.session_state:
+    st.session_state.pending_generation = None
+if "pending_warning" not in st.session_state:
+    st.session_state.pending_warning = ""
 if "pending_raw" not in st.session_state:
     st.session_state.pending_raw = ""
 if "last_reference" not in st.session_state:
@@ -29,12 +34,34 @@ def _from_ymd(s: str) -> date:
     return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
 
 
+def _render_generation_preview(generation: StrategyGenerationResult | None) -> None:
+    if generation is None:
+        return
+    draft = generation.draft
+    st.markdown("**分段理解**")
+    for i, seg in enumerate(draft.segments, 1):
+        st.markdown(
+            f"{i}. **{seg.name}** `{seg.role}` "
+            f"[{seg.window.start}, {seg.window.end}]  \n"
+            f"意图：{seg.intent or '未填写'}  \n"
+            f"技术描述：{seg.technical_description or '未填写'}"
+        )
+
+
 left, right = st.columns([3, 2])
 
 # ---------------- 左：对话 ----------------
 with left:
     st.subheader("对话生成")
     st.caption("描述你想要的 K 线图形策略，模型会产出可执行 DSL。需求不清时会先追问。")
+    if st.button("清空对话", help="清除当前对话历史和待保存 DSL，避免模型沿用上一轮旧策略。"):
+        st.session_state.dlg = []
+        st.session_state.pending_dsl = None
+        st.session_state.pending_generation = None
+        st.session_state.pending_warning = ""
+        st.session_state.pending_raw = ""
+        st.session_state.last_reference = None
+        st.rerun()
 
     # 参考样本股（可选）：代码 + 自定义时间段 + 形态契合买点
     with st.expander("🔬 参考样本股（可选）", expanded=False):
@@ -64,7 +91,7 @@ with left:
         too_long = False
         if p_start and p_end:
             win_dates = tushare_api.trading_days_between(
-                p_start.strftime("%Y%m%d"), p_end.strftime("%Y%m%d")
+                p_start.strftime("%Y%m%d"), p_end.strftime("%Y%m%d"), refresh=False
             )
             too_long = len(win_dates) > strategy_ref.MAX_WINDOW
         if too_long:
@@ -95,6 +122,9 @@ with left:
         dsl: StrategyDSL = st.session_state.pending_dsl
         with st.chat_message("assistant", avatar="🧩"):
             st.success("已生成策略 DSL，确认无误后保存为版本：")
+            _render_generation_preview(st.session_state.pending_generation)
+            if st.session_state.pending_warning:
+                st.warning(st.session_state.pending_warning)
             st.markdown(dsl_to_text(dsl))
             with st.expander("查看原始 JSON"):
                 st.code(dsl.model_dump_json(indent=2), language="json")
@@ -115,11 +145,15 @@ with left:
                         strategy_repo.create_strategy(name, desc, dsl)
                         st.toast(f"已创建策略「{name}」")
                     st.session_state.pending_dsl = None
+                    st.session_state.pending_generation = None
+                    st.session_state.pending_warning = ""
                     st.rerun()
                 except strategy_repo.StrategyError as e:
                     st.error(str(e))
             if cs2.button("✏️ 继续修改"):
                 st.session_state.pending_dsl = None
+                st.session_state.pending_generation = None
+                st.session_state.pending_warning = ""
                 st.rerun()
 
     user_input = st.chat_input("描述你的图形策略，例如：均线多头排列且MACD金叉...")
@@ -135,18 +169,23 @@ with left:
         else:
             ref_start = ref_end = ref_buy = None
         codes_for_ref = None if too_long else (raw_codes or None)
-        st.session_state.last_reference = (
-            strategy_ref.build_sample_reference(
-                raw_codes, start=ref_start, end=ref_end, buy_date=ref_buy
+        try:
+            st.session_state.last_reference = (
+                strategy_ref.build_sample_reference(
+                    raw_codes, start=ref_start, end=ref_end, buy_date=ref_buy
+                )
+                if codes_for_ref else None
             )
-            if codes_for_ref else None
-        )
+        except tushare_api.TushareError as e:
+            st.warning(f"参考样本股已跳过：{e}")
+            st.session_state.last_reference = None
+            codes_for_ref = None
         st.session_state.dlg.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
         with st.chat_message("assistant"):
             with st.spinner("模型思考中..."):
-                raw, dsl, err = llm_client.generate_strategy(
+                raw, dsl, generation, err = llm_client.generate_strategy(
                     st.session_state.dlg,
                     sample_codes=codes_for_ref,
                     ref_start=ref_start, ref_end=ref_end, ref_buy=ref_buy,
@@ -155,11 +194,15 @@ with left:
         if dsl is not None:
             st.session_state.dlg.append({"role": "assistant", "content": dsl_to_text(dsl)})
             st.session_state.pending_dsl = dsl
+            st.session_state.pending_generation = generation
+            st.session_state.pending_warning = err or ""
             st.session_state.pending_raw = raw
         else:
             st.session_state.dlg.append({"role": "assistant", "content": raw})
-        if err:
+        if err and dsl is None:
             st.error(f"生成失败：{err}")
+        elif err:
+            st.warning(err)
         st.rerun()
 
 # ---------------- 右：策略管理 ----------------

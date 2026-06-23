@@ -66,10 +66,13 @@ python -m scripts.run_daily 20240603   # 指定交易日
 }
 ```
 
-- 指标：`MA EMA MA_VOL RSI MACD KDJ BOLL` 及原生字段 `CLOSE/OPEN/HIGH/LOW/VOL/AMOUNT/PCT_CHG`。
+- 指标：`MA EMA MA_VOL RSI MACD KDJ BOLL HHV LLV HHVBARS LLVBARS RISEBARS COUNT EXIST EVERY BARSLAST` 及原生字段 `CLOSE/OPEN/HIGH/LOW/VOL/AMOUNT/PCT_CHG`。
 - 形态：`PATTERN` + `field` ∈ `doji / hammer / engulfing_bull / engulfing_bear / consecutive_up / consecutive_down`。
 - 运算：`> < >= <= cross_up(金叉) cross_down(死叉) between is_true`。
 - 顶层多个条件组之间为「且」，组内规则按 `logic`(and/or) 组合。
+- `offset`：指标可加 `"offset": 1` 表示上一交易日，如昨日收盘价 `{"ind": "CLOSE", "offset": 1}`。
+- 窗口指标：`HHV/LLV/HHVBARS/LLVBARS/RISEBARS` 需 `period`；`HHV/LLV` 为窗口最高/最低值，`HHVBARS/LLVBARS` 为最高/最低值距当前几根 K，`RISEBARS` 为窗口内从阶段低点到之后阶段高点经历的 K 数。
+- 条件聚合：`COUNT/EXIST/EVERY/BARSLAST` 用 `expr` 放一条嵌套 Rule；分别表示窗口内成立次数、窗口内曾经成立、窗口内一直成立、上一次成立距今几根 K。
 
 ## 自测
 

@@ -8,16 +8,40 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core import strategy_repo as R  # noqa: E402
-from core.db import init_db  # noqa: E402
+from core.db import get_session, init_db  # noqa: E402
+from core.models import Strategy  # noqa: E402
 from core.strategy_dsl import StrategyDSL  # noqa: E402
 
 init_db()
 
 created_ids: list[int] = []
+TEST_NAME_PREFIXES = ("版本测试", "启用测试", "DSL往返")
+
+
+def _cleanup_test_strategies() -> None:
+    with get_session() as s:
+        ids = [
+            st.id for st in s.query(Strategy).all()
+            if st.name.startswith(TEST_NAME_PREFIXES)
+        ]
+    for sid in ids:
+        try:
+            R.delete_strategy(sid)
+        except Exception:
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_tests():
+    _cleanup_test_strategies()
+    yield
+    _cleanup_test_strategies()
 
 
 def _spec(period: int):

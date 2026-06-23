@@ -22,6 +22,7 @@ from core.db import get_session
 from core.models import DailyBar, Stock, TradeCal
 
 _pro = None
+_pro_token = None
 _last_call = 0.0
 
 
@@ -30,14 +31,15 @@ class TushareError(RuntimeError):
 
 
 def _client():
-    global _pro
+    global _pro, _pro_token
     token = get_setting("tushare_token")
     if not token:
         raise TushareError("未配置 tushare token，请到「环境设置」页填写。")
     apply_proxies()
-    if _pro is None:
+    if _pro is None or token != _pro_token:
         ts.set_token(token)
         _pro = ts.pro_api()
+        _pro_token = token
     return _pro
 
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import List
 
+import numpy as np
 import pandas as pd
 
 from core import indicators as ind
@@ -15,42 +16,119 @@ from core.strategy_dsl import Indicator, Rule, StrategyDSL
 _BAR_COLS = ["open", "high", "low", "close", "vol", "amount", "pct_chg"]
 
 
+def _apply_offset(series: pd.Series, spec: Indicator) -> pd.Series:
+    offset = spec.offset or 0
+    return series.shift(offset) if offset else series
+
+
+def _price_field(df: pd.DataFrame, spec: Indicator, default: str) -> pd.Series:
+    field = (spec.field or default).lower()
+    if field not in _BAR_COLS:
+        raise ValueError(f"{spec.ind} 不支持字段: {spec.field}")
+    return df[field]
+
+
+def _bars_since_extreme(series: pd.Series, period: int, kind: str) -> pd.Series:
+    def bars_since(values) -> float:
+        target = values.min() if kind == "min" else values.max()
+        positions = np.flatnonzero(values == target)
+        return float(len(values) - 1 - positions[-1])
+
+    return series.rolling(period, min_periods=period).apply(bars_since, raw=True)
+
+
+def _risebars(df: pd.DataFrame, period: int) -> pd.Series:
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    out = np.full(len(df), np.nan)
+    for end in range(period - 1, len(df)):
+        start = end - period + 1
+        lows = low[start:end + 1]
+        low_positions = np.flatnonzero(lows == lows.min())
+        low_pos = int(low_positions[0])
+        highs_after_low = high[start + low_pos:end + 1]
+        high_positions = np.flatnonzero(highs_after_low == highs_after_low.max())
+        high_pos = low_pos + int(high_positions[-1])
+        out[end] = float(high_pos - low_pos)
+    return pd.Series(out, index=df.index)
+
+
+def _barslast(flag: pd.Series) -> pd.Series:
+    values = flag.fillna(False).astype(bool).to_numpy()
+    out = np.full(len(values), np.nan)
+    last_true = None
+    for i, value in enumerate(values):
+        if value:
+            last_true = i
+        if last_true is not None:
+            out[i] = float(i - last_true)
+    return pd.Series(out, index=flag.index)
+
+
+def _resolve_condition_expr(df: pd.DataFrame, spec: Indicator) -> pd.Series:
+    if not spec.expr:
+        raise ValueError(f"{spec.ind} 需要 expr 条件")
+    return _eval_rule(df, Rule.model_validate(spec.expr)).fillna(False).astype(bool)
+
+
 def _resolve_indicator(df: pd.DataFrame, spec: Indicator) -> pd.Series:
     """返回一只股票某指标的 Series（布尔形态也返回布尔 Series）。"""
     name = spec.ind.upper()
     if name == "CLOSE":
-        return df["close"]
+        return _apply_offset(df["close"], spec)
     if name == "OPEN":
-        return df["open"]
+        return _apply_offset(df["open"], spec)
     if name == "HIGH":
-        return df["high"]
+        return _apply_offset(df["high"], spec)
     if name == "LOW":
-        return df["low"]
+        return _apply_offset(df["low"], spec)
     if name == "VOL":
-        return df["vol"]
+        return _apply_offset(df["vol"], spec)
     if name == "AMOUNT":
-        return df["amount"]
+        return _apply_offset(df["amount"], spec)
     if name == "PCT_CHG":
-        return df["pct_chg"]
+        return _apply_offset(df["pct_chg"], spec)
     if name == "MA":
-        return ind.MA(df, spec.period or 5)
+        return _apply_offset(ind.MA(df, spec.period or 5), spec)
     if name == "EMA":
-        return ind.EMA(df, spec.period or 5)
+        return _apply_offset(ind.EMA(df, spec.period or 5), spec)
     if name == "MA_VOL":
-        return ind.MA_VOL(df, spec.period or 5)
+        return _apply_offset(ind.MA_VOL(df, spec.period or 5), spec)
     if name == "RSI":
-        return ind.RSI(df, spec.period or 14)
+        return _apply_offset(ind.RSI(df, spec.period or 14), spec)
     if name == "MACD":
         dif, dea, hist = ind.MACD(df)
-        return {"dif": dif, "dea": dea, "hist": hist}[(spec.field or "dif").lower()]
+        return _apply_offset({"dif": dif, "dea": dea, "hist": hist}[(spec.field or "dif").lower()], spec)
     if name == "KDJ":
         k, d, j = ind.KDJ(df)
-        return {"k": k, "d": d, "j": j}[(spec.field or "k").lower()]
+        return _apply_offset({"k": k, "d": d, "j": j}[(spec.field or "k").lower()], spec)
     if name == "BOLL":
         up, mid, low = ind.BOLL(df, spec.period or 20)
-        return {"upper": up, "mid": mid, "lower": low}[(spec.field or "mid").lower()]
+        return _apply_offset({"upper": up, "mid": mid, "lower": low}[(spec.field or "mid").lower()], spec)
+    if name == "HHV":
+        return _apply_offset(_price_field(df, spec, "high").rolling(spec.period or 20).max(), spec)
+    if name == "LLV":
+        return _apply_offset(_price_field(df, spec, "low").rolling(spec.period or 20).min(), spec)
+    if name == "HHVBARS":
+        return _apply_offset(_bars_since_extreme(_price_field(df, spec, "high"), spec.period or 20, "max"), spec)
+    if name == "LLVBARS":
+        return _apply_offset(_bars_since_extreme(_price_field(df, spec, "low"), spec.period or 20, "min"), spec)
+    if name == "RISEBARS":
+        return _apply_offset(_risebars(df, spec.period or 20), spec)
+    if name == "COUNT":
+        flag = _resolve_condition_expr(df, spec)
+        return _apply_offset(flag.astype(float).rolling(spec.period or 20, min_periods=spec.period or 20).sum(), spec)
+    if name == "EXIST":
+        flag = _resolve_condition_expr(df, spec)
+        return _apply_offset(flag.astype(float).rolling(spec.period or 20, min_periods=spec.period or 20).sum() > 0, spec)
+    if name == "EVERY":
+        period = spec.period or 20
+        flag = _resolve_condition_expr(df, spec)
+        return _apply_offset(flag.astype(float).rolling(period, min_periods=period).sum() == period, spec)
+    if name == "BARSLAST":
+        return _apply_offset(_barslast(_resolve_condition_expr(df, spec)), spec)
     if name == "PATTERN":
-        return _resolve_pattern(df, spec)
+        return _apply_offset(_resolve_pattern(df, spec), spec)
     raise ValueError(f"未知指标: {spec.ind}")
 
 
@@ -110,6 +188,8 @@ def _eval_rule(df: pd.DataFrame, rule: Rule) -> pd.Series:
         lo = rule.between_low if rule.between_low is not None else float("-inf")
         hi = rule.between_high if rule.between_high is not None else float("inf")
         return (L >= lo) & (L <= hi)
+    if op == "is_true":
+        return L.fillna(False).astype(bool)
     raise ValueError(f"未知运算符: {op}")
 
 
