@@ -17,6 +17,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from core import backtest, strategy_repo, tushare_api
+from core import timeutil
 from core.config import get_setting
 from core.db import DATA_DIR
 
@@ -29,8 +30,8 @@ SCHED_DB = f"sqlite:///{(DATA_DIR / 'scheduler.db')}"
 
 def latest_snapshot() -> str:
     """最近一个 <= 今天的交易日（YYYYMMDD）。"""
-    today = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
+    today = timeutil.today_str()
+    start = (timeutil.now() - timedelta(days=20)).strftime("%Y%m%d")
     days = tushare_api.trading_days_between(start, today)
     if not days:
         tushare_api.fetch_trade_cal(start, today)

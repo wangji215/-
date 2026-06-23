@@ -9,6 +9,7 @@ import streamlit as st
 
 from core import llm_client, strategy_repo, tushare_api
 from core import strategy_ref
+from core import timeutil
 from core.strategy_draft import StrategyGenerationResult
 from core.strategy_dsl import StrategyDSL, dsl_to_text
 
@@ -70,8 +71,8 @@ with left:
             key="sample_codes_input",
             placeholder="留空则不注入参考；填写后取其近期指标注入 prompt",
         )
-        latest_cached = tushare_api.latest_cached_trade_date(date.today().strftime("%Y%m%d"))
-        max_d = _from_ymd(latest_cached) if latest_cached else date.today()
+        latest_cached = tushare_api.latest_cached_trade_date(timeutil.today_str())
+        max_d = _from_ymd(latest_cached) if latest_cached else timeutil.today()
         d_end = max_d
         d_start = max_d - timedelta(days=10)
         period = st.date_input(

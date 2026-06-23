@@ -16,6 +16,7 @@ from typing import Optional
 import pandas as pd
 
 from core import indicators, tushare_api
+from core import timeutil
 
 LOOKBACK = 60  # 取最近 60 个交易日，足以稳定 MA20 / MACD(26) / BOLL(20)
 MIN_BARS = 30  # 少于则视为数据不足
@@ -47,7 +48,7 @@ def build_sample_reference(
     if not resolved:
         return None
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = timeutil.today_str()
     use_window = bool(start or end or buy_date)
 
     if use_window:

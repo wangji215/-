@@ -14,10 +14,43 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from core import strategy_engine, strategy_repo, tushare_api
+from core import timeutil
 from core.db import get_session
 from core.models import AnalysisRun, Match, Strategy, Stock, Tracking
 
 TRACK_DAYS = 5  # 跟踪后 5 个交易日
+
+# A 股板块（按 ts_code 归类）。科创板(688/689) 属上交所但单列；
+# 深证含主板/中小板/创业板；北证即北交所(.BJ)。
+BOARDS = ["上证", "深证", "北证", "科创板"]
+
+
+def classify_board(ts_code: str) -> str:
+    """根据 ts_code 归类板块：上证 / 深证 / 北证 / 科创板 / 其他。
+
+    按 ts_code 后缀（交易所）+ 前缀（688/689 科创板）判定，不依赖 stock 缓存。
+    """
+    code, _, suffix = str(ts_code).partition(".")
+    if suffix == "BJ":
+        return "北证"
+    if suffix == "SH":
+        return "科创板" if code.startswith(("688", "689")) else "上证"
+    if suffix == "SZ":
+        return "深证"
+    return "其他"
+
+
+def _filter_bars_by_boards(bars: pd.DataFrame, boards: Optional[List[str]]) -> pd.DataFrame:
+    """仅保留属于指定板块的股票的日 K。全选（或 None）则原样返回。"""
+    if not boards:
+        return bars
+    if set(BOARDS).issubset(set(boards)):
+        return bars  # 四个板块都勾选 = 不过滤
+    keep = set(boards)
+    codes = [c for c in bars["ts_code"].astype(str).unique() if classify_board(c) in keep]
+    if not codes:
+        return bars.iloc[0:0]
+    return bars[bars["ts_code"].isin(codes)]
 
 
 def _snapshot_close(bars: pd.DataFrame, ts_code: str, trade_date: str) -> Optional[float]:
@@ -36,13 +69,23 @@ def future_trade_days(snapshot_date: str, n: int = TRACK_DAYS) -> List[str]:
     return days[: n + 1]
 
 
-def run_analysis(strategy_id: int, snapshot_date: str, persist: bool = True) -> AnalysisRun:
-    """对一条策略在 snapshot_date 运行分析，返回 AnalysisRun（已持久化）。"""
+def run_analysis(
+    strategy_id: int,
+    snapshot_date: str,
+    persist: bool = True,
+    boards: Optional[List[str]] = None,
+) -> AnalysisRun:
+    """对一条策略在 snapshot_date 运行分析，返回 AnalysisRun（已持久化）。
+
+    Args:
+        boards: 仅分析这些板块（``BOARDS`` 的子集，如 ``["上证", "科创板"]``）。
+            None 或全选表示不过滤（全市场）。过滤在引擎求值前完成，可显著提速。
+    """
     dsl = strategy_repo.get_current_dsl(strategy_id)
     if dsl is None:
         raise ValueError("策略无可用 DSL 版本")
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = timeutil.today_str()
     run = AnalysisRun(
         strategy_id=strategy_id,
         run_date=today,
@@ -58,6 +101,8 @@ def run_analysis(strategy_id: int, snapshot_date: str, persist: bool = True) -> 
         lookback_dates = tushare_api.get_lookback_dates(snapshot_date, dsl.lookback)
         tushare_api.ensure_bars_for_dates(lookback_dates)
         bars = tushare_api.load_bars(lookback_dates)
+        # 仅对勾选板块求值：减少引擎分组的股票数，提速。
+        bars = _filter_bars_by_boards(bars, boards)
         matched_codes = strategy_engine.evaluate(dsl, bars, snapshot_date)
         run.matched_count = len(matched_codes)
 

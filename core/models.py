@@ -15,11 +15,13 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 
+from core import timeutil
 from core.db import Base
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    # 统一北京时间（UTC+8，naive），与机器本地时区无关。
+    return timeutil.now()
 
 
 class Setting(Base):

@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core import backtest, strategy_repo, tushare_api
+from core import timeutil
 from core.db import get_session
 from core.models import AnalysisRun, Match, Stock
 
@@ -107,30 +108,44 @@ with tab_run:
     if not strategies:
         st.info("还没有策略，请先到「🎯 策略生成」页创建。")
     else:
-        col1, col2, col3 = st.columns([2, 2, 1])
+        col1, col2 = st.columns([2, 2])
         with col1:
             options = {f"{s.id}: {s.name}{' 🟢' if s.active else ''}": s.id for s in strategies}
             label = st.selectbox("选择策略", list(options.keys()))
             strategy_id = options[label]
         with col2:
-            today = date.today()
+            today = timeutil.today()
             default_d = today - timedelta(days=1)
             snap = st.date_input("数据时间点（交易日）", value=default_d, max_value=today, help="选某个交易日的收盘数据进行分析")
             snapshot_date = _to_yyyymmdd(snap)
-        with col3:
-            st.write("")
-            st.write("")
-            run_btn = st.button("🚀 运行分析", type="primary")
+
+        # 板块勾选：仅对勾选板块分析，减少引擎处理股票数，显著提速。
+        st.markdown("**分析板块**（仅对勾选板块运行，可显著提速）")
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            cb_sh = st.checkbox("上证", value=True, key="board_sh")
+        with b2:
+            cb_sz = st.checkbox("深证", value=True, key="board_sz")
+        with b3:
+            cb_bj = st.checkbox("北证", value=True, key="board_bj")
+        with b4:
+            cb_kcb = st.checkbox("科创板", value=True, key="board_kcb")
+        run_btn = st.button("🚀 运行分析", type="primary")
 
         if run_btn:
-            try:
-                with st.spinner("抓取日K并匹配中（首次较慢，已缓存会很快）..."):
-                    run = backtest.run_analysis(strategy_id, snapshot_date)
-                st.session_state["last_run_id"] = run.id
-                st.success(f"完成：匹配 {run.matched_count} 只（run #{run.id}）")
-                st.rerun()
-            except Exception as e:  # noqa: BLE001
-                st.error(f"运行失败：{e}")
+            boards = [n for n, on in [("上证", cb_sh), ("深证", cb_sz),
+                                      ("北证", cb_bj), ("科创板", cb_kcb)] if on]
+            if not boards:
+                st.warning("请至少勾选一个板块。")
+            else:
+                try:
+                    with st.spinner(f"抓取日K并匹配中（板块：{'、'.join(boards)}；首次较慢，已缓存会很快）..."):
+                        run = backtest.run_analysis(strategy_id, snapshot_date, boards=boards)
+                    st.session_state["last_run_id"] = run.id
+                    st.success(f"完成：匹配 {run.matched_count} 只（run #{run.id}）")
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"运行失败：{e}")
 
         # 展示最近一次运行的匹配
         run_id = st.session_state.get("last_run_id")
@@ -212,9 +227,33 @@ with tab_history:
     else:
         st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
         chosen = st.number_input("查看 run 编号", min_value=1, value=data[0]["run"], step=1)
-        if st.button("加载该 run 的匹配与跟踪"):
+        if st.button("加载该 run 的匹配"):
             st.session_state["last_run_id"] = int(chosen)
+            st.session_state["history_load_run_id"] = int(chosen)
             st.rerun()
+
+        # 已加载 run 的全部匹配股票：直接在本标签内渲染，保证「该 run 的所有匹配股票」正常显示。
+        loaded = st.session_state.get("history_load_run_id")
+        if loaded is not None:
+            matches = backtest.matches_for_run(loaded)
+            st.subheader(f"run #{loaded} 的匹配股票（共 {len(matches)} 只）")
+            if not matches:
+                st.caption("该 run 无匹配股票。")
+            else:
+                name_map = _name_map([m.ts_code for m in matches])
+                tracked = backtest.tracked_match_ids(loaded)
+                ov = pd.DataFrame([
+                    {
+                        "代码": m.ts_code,
+                        "名称": name_map.get(m.ts_code, ""),
+                        "匹配策略": strat_map.get(m.strategy_id, str(m.strategy_id) if m.strategy_id else ""),
+                        "分析交易日": m.snapshot_date,
+                        "状态": "已跟踪" if m.id in tracked else "未跟踪",
+                    }
+                    for m in matches
+                ])
+                st.dataframe(ov, hide_index=True, use_container_width=True)
+                st.caption("如需查看 K 线 / 跟踪详情，可到「🚀 运行分析」标签（已自动选中该 run）。")
 
 # ---------------- Tab 3: 归档 ----------------
 with tab_archive:
