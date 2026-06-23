@@ -296,37 +296,78 @@ def tracking_df(match_id: int) -> pd.DataFrame:
 
 
 def archive_summary() -> pd.DataFrame:
-    """已跟踪股票归档摘要：按购入日期(=snapshot_date)排序，含名称/策略名/买入价/T0收盘/T+1..T+5累计。
+    """已跟踪股票归档摘要：每行对应一个 (buy_date, ts_code, strategy_id) 跟踪组。
 
-    展示**全部已跟踪**记录（买入价未填亦列出）。每行对应一个 (buy_date, ts_code, strategy_id)。
+    列含：购入日期 / 运行日期(分析运行日) / 归档时间(进入跟踪的时间) /
+    代码 / 名称 / 策略 / 策略ID / 买入价 / T0收盘 / T+1..T+5累计%。
+    展示**全部已跟踪**记录（买入价未填亦列出）。
     """
     with get_session() as s:
+        # left join 到 Match→AnalysisRun 取「运行日期」；缺 run 也不丢跟踪行
         rows = (
-            s.query(Tracking)
+            s.query(Tracking, AnalysisRun.run_date)
+            .outerjoin(Match, Match.id == Tracking.match_id)
+            .outerjoin(AnalysisRun, AnalysisRun.id == Match.run_id)
             .order_by(Tracking.buy_date.desc(), Tracking.ts_code, Tracking.offset)
             .all()
         )
         if not rows:
             return pd.DataFrame()
         # 批量解析名称 / 策略名，避免逐行查询
-        codes = {r.ts_code for r in rows}
-        sids = {r.strategy_id for r in rows if r.strategy_id is not None}
+        codes = {t.ts_code for (t, _) in rows}
+        sids = {t.strategy_id for (t, _) in rows if t.strategy_id is not None}
         name_by_code = {r.ts_code: r.name for r in s.query(Stock).filter(Stock.ts_code.in_(codes)).all()}
         name_by_sid = {r.id: r.name for r in s.query(Strategy).filter(Strategy.id.in_(sids)).all()}
 
     records = {}
-    for r in rows:
-        key = (r.buy_date, r.ts_code, r.strategy_id)
+    for t, run_date in rows:
+        key = (t.buy_date, t.ts_code, t.strategy_id)
         rec = records.setdefault(
             key,
-            {"购入日期": r.buy_date, "代码": r.ts_code,
-             "名称": name_by_code.get(r.ts_code, ""),
-             "策略": name_by_sid.get(r.strategy_id, str(r.strategy_id)) if r.strategy_id is not None else "",
-             "买入价": r.buy_price, "T0收盘": None,
-             **{f"T+{i}累计%": None for i in range(1, TRACK_DAYS + 1)}},
+            {
+                "购入日期": t.buy_date,
+                "运行日期": run_date or "",
+                "归档时间": t.created_at,
+                "代码": t.ts_code,
+                "名称": name_by_code.get(t.ts_code, ""),
+                "策略": name_by_sid.get(t.strategy_id, str(t.strategy_id)) if t.strategy_id is not None else "",
+                "策略ID": t.strategy_id,
+                "买入价": t.buy_price,
+                "T0收盘": None,
+                **{f"T+{i}累计%": None for i in range(1, TRACK_DAYS + 1)},
+            },
         )
-        if r.offset == 0:
-            rec["T0收盘"] = r.close
+        # 运行日期 / 归档时间 取组内最新（同一记录可能跨多次运行/补算）
+        if run_date and (not rec["运行日期"] or run_date > rec["运行日期"]):
+            rec["运行日期"] = run_date
+        if t.created_at and (not rec["归档时间"] or t.created_at > rec["归档时间"]):
+            rec["归档时间"] = t.created_at
+        if t.offset == 0:
+            rec["T0收盘"] = t.close
         else:
-            rec[f"T+{r.offset}累计%"] = r.cum_pct
+            rec[f"T+{t.offset}累计%"] = t.cum_pct
     return pd.DataFrame(list(records.values()))
+
+
+def delete_tracking_groups(keys: List[tuple]) -> int:
+    """批量删除归档记录：``keys`` 为 [(buy_date, ts_code, strategy_id), ...]。
+
+    每个三元组定位一组 T+0..T+5 跟踪行（与 :func:`archive_summary` 的分组键一致），
+    删除其全部跟踪数据。返回实际删除的跟踪行数。Matches（筛选命中）保留不动。
+    """
+    if not keys:
+        return 0
+    total = 0
+    with get_session() as s:
+        for buy_date, ts_code, strategy_id in keys:
+            q = s.query(Tracking).filter(
+                Tracking.buy_date == buy_date,
+                Tracking.ts_code == ts_code,
+            )
+            if strategy_id is None:
+                q = q.filter(Tracking.strategy_id.is_(None))
+            else:
+                q = q.filter(Tracking.strategy_id == strategy_id)
+            total += q.delete(synchronize_session=False)
+        s.commit()
+    return total

@@ -94,6 +94,27 @@ def _render_match(m: Match, lookback_dates: list[str], tracked: bool, name: str 
                         st.warning("请输入大于 0 的价格")
 
 
+@st.dialog("确认删除归档记录")
+def _confirm_delete_dialog() -> None:
+    """二次确认弹窗：删除勾选的归档记录。待删 key 与预览从 session_state 读取。"""
+    keys = st.session_state.get("archive_pending_delete", [])
+    preview = st.session_state.get("archive_pending_preview")
+    st.warning(f"将删除选中的 {len(keys)} 条归档记录及其 T+0..T+5 跟踪数据，此操作不可撤销。")
+    if preview is not None and not preview.empty:
+        st.dataframe(preview, hide_index=True, use_container_width=True)
+    c1, c2 = st.columns(2)
+    if c1.button("取消", use_container_width=True):
+        st.session_state.pop("archive_pending_delete", None)
+        st.session_state.pop("archive_pending_preview", None)
+        st.rerun()
+    if c2.button("确认删除", type="primary", use_container_width=True):
+        n = backtest.delete_tracking_groups(keys)
+        st.session_state.pop("archive_pending_delete", None)
+        st.session_state.pop("archive_pending_preview", None)
+        st.toast(f"已删除 {len(keys)} 条归档记录（{n} 行跟踪）")
+        st.rerun()
+
+
 # 页面加载时懒计算补齐已到交易日的收盘
 try:
     backtest.fill_and_recompute()
@@ -261,6 +282,50 @@ with tab_archive:
     if df.empty:
         st.info("还没有跟踪记录——运行分析后，在匹配结果里勾选股票并点「📊 交易日分析」，这里按购入日期 + 策略归档展示。")
     else:
-        for buy_date, group in df.groupby("购入日期"):
-            with st.expander(f"📅 {buy_date}  ·  {len(group)} 只"):
-                st.dataframe(group.drop(columns=["购入日期"]), hide_index=True, use_container_width=True)
+        # 排序：按运行日期 或 归档时间，均新→旧
+        sort_mode = st.radio(
+            "排序方式",
+            ["按运行日期（新→旧）", "按归档时间（新→旧）"],
+            horizontal=True,
+            key="archive_sort_mode",
+            help="运行日期=分析运行发生日；归档时间=进入跟踪(归档)的时间。",
+        )
+        if sort_mode.startswith("按运行日期"):
+            df = df.sort_values("运行日期", ascending=False, na_position="last")
+        else:
+            df = df.sort_values("归档时间", ascending=False, na_position="last")
+        df = df.reset_index(drop=True)
+
+        # 用 (购入日期|代码|策略ID) 作隐藏索引，删除时回填定位 key
+        df["_key"] = df.apply(
+            lambda r: f"{r['购入日期']}|{r['代码']}|{'' if pd.isna(r['策略ID']) else int(r['策略ID'])}",
+            axis=1,
+        )
+        df = df.set_index("_key").drop(columns=["策略ID"])
+        df.insert(0, "删除", False)
+
+        st.subheader(f"归档记录（共 {len(df)} 只）")
+        # 行集合变化即换 key，避免删除后 checkbox 状态错位
+        fp = abs(hash(tuple(sorted(df.index.tolist())))) % 1000000
+        edited = st.data_editor(
+            df,
+            column_config={"删除": st.column_config.CheckboxColumn("勾选删除", default=False)},
+            disabled=[c for c in df.columns if c != "删除"],
+            hide_index=True,
+            key=f"archive_del_editor_{fp}",
+            use_container_width=True,
+        )
+        if st.button("🗑️ 删除选中", type="primary"):
+            checked = edited[edited["删除"]]
+            if checked.empty:
+                st.warning("请先在表中勾选要删除的记录。")
+            else:
+                sel_keys = []
+                for keystr in checked.index:
+                    bd, code, sid = str(keystr).rsplit("|", 2)
+                    sel_keys.append((bd, code, (int(sid) if sid else None)))
+                st.session_state["archive_pending_delete"] = sel_keys
+                st.session_state["archive_pending_preview"] = checked.drop(columns=["删除"])
+        # 二次确认弹窗：pending_delete 存在则弹出，确认后执行删除
+        if st.session_state.get("archive_pending_delete"):
+            _confirm_delete_dialog()
