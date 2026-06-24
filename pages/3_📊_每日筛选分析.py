@@ -66,7 +66,7 @@ def _render_match(m: Match, lookback_dates: list[str], tracked: bool, name: str 
     with st.expander(header):
         tc1, tc2 = st.columns([2, 3])
         with tc1:
-            st.plotly_chart(_kline_fig(m.ts_code, lookback_dates, header), use_container_width=True)
+            st.plotly_chart(_kline_fig(m.ts_code, lookback_dates, header), width="stretch")
         with tc2:
             if not tracked:
                 st.caption("未跟踪 — 点上方「📊 交易日分析」开启购入价/交易日跟踪")
@@ -79,7 +79,7 @@ def _render_match(m: Match, lookback_dates: list[str], tracked: bool, name: str 
                 "day_pct": "当日涨跌%", "cum_pct": "累计涨跌%",
             })
             show["T"] = show["T"].map(lambda x: f"T+{x}")
-            st.dataframe(show[["T", "交易日", "收盘", "当日涨跌%", "累计涨跌%"]], hide_index=True, use_container_width=True)
+            st.dataframe(show[["T", "交易日", "收盘", "当日涨跌%", "累计涨跌%"]], hide_index=True, width="stretch")
 
             with st.form(f"buy_{m.id}"):
                 cur = float(df["buy_price"].iloc[0]) if not df.empty and df["buy_price"].iloc[0] else 0.0
@@ -101,13 +101,13 @@ def _confirm_delete_dialog() -> None:
     preview = st.session_state.get("archive_pending_preview")
     st.warning(f"将删除选中的 {len(keys)} 条归档记录及其 T+0..T+5 跟踪数据，此操作不可撤销。")
     if preview is not None and not preview.empty:
-        st.dataframe(preview, hide_index=True, use_container_width=True)
+        st.dataframe(preview, hide_index=True, width="stretch")
     c1, c2 = st.columns(2)
-    if c1.button("取消", use_container_width=True):
+    if c1.button("取消", width="stretch"):
         st.session_state.pop("archive_pending_delete", None)
         st.session_state.pop("archive_pending_preview", None)
         st.rerun()
-    if c2.button("确认删除", type="primary", use_container_width=True):
+    if c2.button("确认删除", type="primary", width="stretch"):
         n = backtest.delete_tracking_groups(keys)
         st.session_state.pop("archive_pending_delete", None)
         st.session_state.pop("archive_pending_preview", None)
@@ -207,7 +207,7 @@ with tab_run:
                     disabled=[c for c in ov.columns if c != "选择"],
                     hide_index=True,
                     key=f"sel_{run_id}",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 _, btn_col = st.columns([4, 1])
                 if btn_col.button("📊 交易日分析", type="primary",
@@ -246,7 +246,7 @@ with tab_history:
     if not data:
         st.info("还没有运行记录。")
     else:
-        st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
         chosen = st.number_input("查看 run 编号", min_value=1, value=data[0]["run"], step=1)
         if st.button("加载该 run 的匹配"):
             st.session_state["last_run_id"] = int(chosen)
@@ -273,7 +273,7 @@ with tab_history:
                     }
                     for m in matches
                 ])
-                st.dataframe(ov, hide_index=True, use_container_width=True)
+                st.dataframe(ov, hide_index=True, width="stretch")
                 st.caption("如需查看 K 线 / 跟踪详情，可到「🚀 运行分析」标签（已自动选中该 run）。")
 
 # ---------------- Tab 3: 归档 ----------------
@@ -282,16 +282,16 @@ with tab_archive:
     if df.empty:
         st.info("还没有跟踪记录——运行分析后，在匹配结果里勾选股票并点「📊 交易日分析」，这里按购入日期 + 策略归档展示。")
     else:
-        # 排序：按运行日期 或 归档时间，均新→旧
+        # 排序：按购入日期 或 归档时间，均新→旧
         sort_mode = st.radio(
             "排序方式",
-            ["按运行日期（新→旧）", "按归档时间（新→旧）"],
+            ["按购入日期（新→旧）", "按归档时间（新→旧）"],
             horizontal=True,
             key="archive_sort_mode",
-            help="运行日期=分析运行发生日；归档时间=进入跟踪(归档)的时间。",
+            help="购入日期=买入发生日；归档时间=进入跟踪(归档)的时间。",
         )
-        if sort_mode.startswith("按运行日期"):
-            df = df.sort_values("运行日期", ascending=False, na_position="last")
+        if sort_mode.startswith("按购入日期"):
+            df = df.sort_values("购入日期", ascending=False, na_position="last")
         else:
             df = df.sort_values("归档时间", ascending=False, na_position="last")
         df = df.reset_index(drop=True)
@@ -313,7 +313,7 @@ with tab_archive:
             disabled=[c for c in df.columns if c != "删除"],
             hide_index=True,
             key=f"archive_del_editor_{fp}",
-            use_container_width=True,
+            width="stretch",
         )
         if st.button("🗑️ 删除选中", type="primary"):
             checked = edited[edited["删除"]]
