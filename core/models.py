@@ -58,6 +58,35 @@ class StrategyVersion(Base):
     )
 
 
+class TradeRule(Base):
+    """交易规则（持仓/退出策略）。独立于策略 DSL，回测时按 id 引用。
+
+    由 pages/5_⏰_交易规则.py 表单创建，每条最多保留 5 版。
+    与 Strategy 解耦：同一规则可跨策略复用，同一策略也可配多套规则试参数。
+    """
+
+    __tablename__ = "trade_rules"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, default="")
+    current_version_id = Column(Integer, ForeignKey("trade_rule_versions.id", use_alter=True))
+    created_at = Column(DateTime, default=_now)
+
+
+class TradeRuleVersion(Base):
+    """交易规则的某一版本。spec_json 由 TradeRuleSpec（core/trade_rule_dsl.py）校验。"""
+
+    __tablename__ = "trade_rule_versions"
+    id = Column(Integer, primary_key=True)
+    rule_id = Column(Integer, ForeignKey("trade_rules.id"), nullable=False)
+    version_no = Column(Integer, nullable=False)
+    spec_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=_now)
+    __table_args__ = (
+        UniqueConstraint("rule_id", "version_no", name="uq_trv_rule_version"),
+    )
+
+
 class Stock(Base):
     """缓存 tushare stock_basic。"""
 

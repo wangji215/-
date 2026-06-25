@@ -185,6 +185,7 @@ class DslSignalStrategy(bt.Strategy):
         cash_buffer=0.05,
         trade_start=None,
         trade_end=None,
+        trade_rule=None,
         printlog=True,
     )
 
@@ -192,6 +193,11 @@ class DslSignalStrategy(bt.Strategy):
         self.order_records = []
         self.signal_records = []
         self._data_by_name = {data._name: data for data in self.datas}
+        # name -> {"buy_date": "YYYY-MM-DD", "buy_date_str": "YYYYMMDD", "buy_price": float}
+        # 仅在 notify_order 写入；next() 只读。SELL 完成时 pop。
+        self._positions_meta: dict[str, dict] = {}
+        # 回测内见过的交易日（YYYYMMDD 升序），用于计算 hold_days
+        self._seen_dates: list[str] = []
 
     def log(self, message):
         if self.p.printlog and self.datas:
@@ -199,6 +205,13 @@ class DslSignalStrategy(bt.Strategy):
 
     def _is_current_bar(self, data, trade_date):
         return _date_from_data(data).strftime("%Y%m%d") == trade_date
+
+    def _hold_days(self, buy_date_str: str, current_date_str: str) -> int:
+        """基于回测内见过的交易日列表算间隔（买入当日=0）。"""
+        try:
+            return self._seen_dates.index(current_date_str) - self._seen_dates.index(buy_date_str)
+        except ValueError:
+            return 0
 
     def next(self):
         if not self.datas:
@@ -211,43 +224,98 @@ class DslSignalStrategy(bt.Strategy):
         if self.p.trade_end and current > self.p.trade_end:
             return
 
-        signal_map = self.p.signal_map or {}
-        target_names = list(signal_map.get(trade_date, []))[: self.p.max_positions]
-        target_datas = [
-            self._data_by_name[name]
-            for name in target_names
-            if name in self._data_by_name and self._is_current_bar(self._data_by_name[name], trade_date)
-        ]
-        target_set = set(target_datas)
+        if trade_date not in self._seen_dates:
+            self._seen_dates.append(trade_date)
 
+        rule = self.p.trade_rule or {}
+        max_positions = int(rule.get("max_positions", self.p.max_positions))
+        stop_loss_pct = rule.get("stop_loss_pct")     # magnitude，None=不止损
+        take_profit_pct = rule.get("take_profit_pct") # magnitude，None=不止盈
+        max_holding_days = int(rule.get("max_holding_days", 0))
+        time_stop = bool(rule.get("time_stop", True))
+        position_pct = float(rule.get("position_pct", 1.0 / max(1, max_positions)))
+
+        signal_map = self.p.signal_map or {}
+        signal_codes = list(signal_map.get(trade_date, []))
         self.signal_records.append(
             {
                 "date": current.strftime("%Y-%m-%d"),
-                "matched": len(signal_map.get(trade_date, [])),
-                "targets": ",".join(target_names),
+                "matched": len(signal_codes),
+                "targets": ",".join(signal_codes[:max_positions]),
             }
         )
-        self.log("matched=%d targets=%s" % (len(signal_map.get(trade_date, [])), target_names))
+        self.log("matched=%d signals=%s" % (len(signal_codes), signal_codes[:max_positions]))
 
+        # 1. 卖出检查：止损 > 止盈 > 时间到（同日按优先级，触发即卖）
         for data in self.datas:
             position = self.getposition(data)
-            if position.size and data not in target_set and self._is_current_bar(data, trade_date):
+            if not position.size:
+                # 无持仓但 meta 残留则清理（broker 与 meta 异步的兜底）
+                self._positions_meta.pop(data._name, None)
+                continue
+            if not self._is_current_bar(data, trade_date):
+                continue
+            meta = self._positions_meta.get(data._name)
+            if not meta:
+                # 数据异常：有持仓无买入记录，跳过本次卖出判断
+                continue
+            buy_price = float(meta["buy_price"])
+            current_price = float(data.close[0])
+            pnl_pct = (current_price - buy_price) / buy_price if buy_price else 0.0
+            hold_days = self._hold_days(meta["buy_date_str"], trade_date)
+            should_sell = False
+            reason = ""
+            if stop_loss_pct is not None and pnl_pct <= -float(stop_loss_pct) / 100.0:
+                should_sell = True
+                reason = "stop_loss"
+            elif take_profit_pct is not None and pnl_pct >= float(take_profit_pct) / 100.0:
+                should_sell = True
+                reason = "take_profit"
+            elif time_stop and max_holding_days > 0 and hold_days >= max_holding_days:
+                should_sell = True
+                reason = "time_stop"
+            if should_sell:
                 self.order_target_value(data=data, target=0.0)
+                self.log("SELL trigger=%s %s hold=%dd pnl=%.2f%%" % (reason, data._name, hold_days, pnl_pct * 100))
+
+        # 2. 买入检查：先算空仓位数
+        current_positions = sum(1 for d in self.datas if self.getposition(d).size > 0)
+        available = max_positions - current_positions
+        if available <= 0:
+            return
+
+        # 从今日信号里挑出（a）有当日 bar 的（b）当前未持仓的，取前 available 只
+        target_datas = []
+        for name in signal_codes:
+            if name not in self._data_by_name:
+                continue
+            data = self._data_by_name[name]
+            if not self._is_current_bar(data, trade_date):
+                continue
+            if self.getposition(data).size > 0:
+                continue
+            target_datas.append(data)
+            if len(target_datas) >= available:
+                break
 
         if not target_datas:
             return
 
-        target_value = self.broker.getvalue() * (1.0 - self.p.cash_buffer) / len(target_datas)
+        # 用 position_pct 仓位（默认与 1/max_positions 等权一致）
+        target_value = self.broker.getvalue() * (1.0 - self.p.cash_buffer) * position_pct
         for data in target_datas:
             self.order_target_value(data=data, target=target_value)
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
             side = "BUY" if order.isbuy() else "SELL"
+            name = order.data._name
+            bar_date = _date_from_data(order.data).strftime("%Y-%m-%d")
+            bar_date_str = _date_from_data(order.data).strftime("%Y%m%d")
             self.order_records.append(
                 {
-                    "date": _date_from_data(order.data).strftime("%Y-%m-%d"),
-                    "code": order.data._name,
+                    "date": bar_date,
+                    "code": name,
                     "side": side,
                     "size": float(order.executed.size),
                     "price": float(order.executed.price),
@@ -255,9 +323,18 @@ class DslSignalStrategy(bt.Strategy):
                     "commission": float(order.executed.comm),
                 }
             )
+            # 仅在 notify_order 写 _positions_meta，防 partial fill desync
+            if order.isbuy():
+                self._positions_meta[name] = {
+                    "buy_date": bar_date,
+                    "buy_date_str": bar_date_str,
+                    "buy_price": float(order.executed.price),
+                }
+            else:
+                self._positions_meta.pop(name, None)
             self.log(
                 "%s %s size=%s price=%.3f value=%.2f"
-                % (side, order.data._name, order.executed.size, order.executed.price, order.executed.value)
+                % (side, name, order.executed.size, order.executed.price, order.executed.value)
             )
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.order_records.append(
@@ -521,9 +598,41 @@ def _extra_analyzers(cerebro):
     return cerebro
 
 
+class StampDutyCommissionInfo(bt.CommissionInfo):
+    """A 股风格佣金：买卖都收 commission，卖出额外收 stamp_duty（印花税）。
+
+    backtrader 默认 CommissionInfo 双边等比例；本子类重写 getcommission，
+    size<0（卖出）时加收 stamp_duty。2023-08 起印花税率为 0.05%。
+    """
+    params = (("stamp_duty", 0.0),)
+
+    def getcommission(self, size, price):
+        comm = abs(size) * price * self.p.commission
+        if size < 0:
+            comm += abs(size) * price * self.p.stamp_duty
+        return comm
+
+
+def _apply_costs(cerebro, commission=0.0003, stamp_duty=0.0005, slippage=0.001):
+    """统一注入：双边佣金 + 卖出印花税 + 百分比滑点。
+
+    - commission: 双边，券商佣金（默认万三）
+    - stamp_duty: 卖出额外，A 股印花税（默认 0.05% = 万分之五）
+    - slippage: 百分比滑点（默认 0.1%），模拟成交价偏离
+    """
+    cerebro.broker.addcommissioninfo(
+        StampDutyCommissionInfo(commission=commission, stamp_duty=stamp_duty)
+    )
+    if slippage and slippage > 0:
+        cerebro.broker.set_slippage_perc(perc=slippage)
+    return cerebro
+
+
 def build_cerebro(
     cash=100000.0,
     commission=0.0003,
+    stamp_duty=0.0005,
+    slippage=0.001,
     lookback=90,
     max_positions=5,
     cash_buffer=0.05,
@@ -531,7 +640,7 @@ def build_cerebro(
 ):
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(cash)
-    cerebro.broker.setcommission(commission=commission)
+    _apply_costs(cerebro, commission=commission, stamp_duty=stamp_duty, slippage=slippage)
     cerebro.addstrategy(
         FourStagePullbackStrategy,
         lookback=lookback,
@@ -551,15 +660,18 @@ def build_dsl_cerebro(
     signal_map,
     cash=100000.0,
     commission=0.0003,
+    stamp_duty=0.0005,
+    slippage=0.001,
     max_positions=5,
     cash_buffer=0.05,
     trade_start=None,
     trade_end=None,
+    trade_rule=None,
     printlog=True,
 ):
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(cash)
-    cerebro.broker.setcommission(commission=commission)
+    _apply_costs(cerebro, commission=commission, stamp_duty=stamp_duty, slippage=slippage)
     cerebro.addstrategy(
         DslSignalStrategy,
         signal_map=signal_map,
@@ -567,6 +679,7 @@ def build_dsl_cerebro(
         cash_buffer=cash_buffer,
         trade_start=trade_start.date() if hasattr(trade_start, "date") else trade_start,
         trade_end=trade_end.date() if hasattr(trade_end, "date") else trade_end,
+        trade_rule=trade_rule,
         printlog=printlog,
     )
     cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
@@ -889,6 +1002,8 @@ def run_dsl_backtest(
     codes=None,
     cash=100000.0,
     commission=0.0003,
+    stamp_duty=0.0005,
+    slippage=0.001,
     max_positions=5,
     cash_buffer=0.05,
     fromdate=None,
@@ -896,6 +1011,7 @@ def run_dsl_backtest(
     max_codes=None,
     benchmark_code=None,
     pool_index_code=None,
+    trade_rule_spec=None,
     printlog=False,
 ):
     if not db_path:
@@ -983,10 +1099,13 @@ def run_dsl_backtest(
         signal_map,
         cash=cash,
         commission=commission,
+        stamp_duty=stamp_duty,
+        slippage=slippage,
         max_positions=max_positions,
         cash_buffer=cash_buffer,
         trade_start=fromdate,
         trade_end=todate,
+        trade_rule=trade_rule_spec,
         printlog=printlog,
     )
     loaded = add_db_data_feeds_from_frame(cerebro, bars_for_bt)
@@ -1058,6 +1177,8 @@ def parse_args():
     parser.add_argument("--codes", help="Comma-separated ts_code list when using --db")
     parser.add_argument("--cash", type=float, default=100000.0)
     parser.add_argument("--commission", type=float, default=0.0003)
+    parser.add_argument("--stamp-duty", type=float, default=0.0005, help="A 股印花税（卖出单边），默认 0.05%%")
+    parser.add_argument("--slippage", type=float, default=0.001, help="百分比滑点，默认 0.1%%")
     parser.add_argument("--lookback", type=int, default=90)
     parser.add_argument("--max-positions", type=int, default=5)
     parser.add_argument("--fromdate", help="YYYY-MM-DD")
@@ -1066,6 +1187,7 @@ def parse_args():
     parser.add_argument("--max-codes", type=int, help="Limit number of DB codes loaded")
     parser.add_argument("--benchmark-code", help="Benchmark ts_code (e.g. 000300.SH for 沪深300) loaded from daily_bars")
     parser.add_argument("--pool-index-code", help="Dynamic stock pool from index_weight (e.g. 000300.SH = 沪深300 constituents)")
+    parser.add_argument("--trade-rule-id", type=int, help="Trade rule id (from trade_rules table); omit to use built-in defaults")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--strategy-id", type=int, help="Run saved DSL strategy instead of built-in four-stage strategy")
@@ -1080,18 +1202,28 @@ def main():
     if args.strategy_id:
         if not args.db:
             raise ValueError("--strategy-id requires --db")
+        trade_rule_spec = None
+        if args.trade_rule_id:
+            from core import trade_rule_repo
+            spec = trade_rule_repo.get_current_rule_spec(int(args.trade_rule_id))
+            if spec is None:
+                raise ValueError("trade_rule id=%s not found or has no version" % args.trade_rule_id)
+            trade_rule_spec = spec.model_dump()
         result = run_dsl_backtest(
             strategy_id=args.strategy_id,
             db_path=args.db,
             codes=args.codes,
             cash=args.cash,
             commission=args.commission,
+            stamp_duty=args.stamp_duty,
+            slippage=args.slippage,
             max_positions=args.max_positions,
             fromdate=fromdate,
             todate=todate,
             max_codes=args.max_codes,
             benchmark_code=args.benchmark_code,
             pool_index_code=args.pool_index_code,
+            trade_rule_spec=trade_rule_spec,
             printlog=not args.quiet,
         )
     else:

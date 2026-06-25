@@ -9,10 +9,11 @@ from plotly.subplots import make_subplots
 import streamlit as st
 from sqlalchemy import func
 
-from core import strategy_repo, tushare_api
+from core import strategy_repo, trade_rule_repo, tushare_api
 from core.db import DB_PATH, get_session
 from core.models import DailyBar, Stock
 from core.strategy_dsl import dsl_to_text
+from core.trade_rule_dsl import rule_to_text
 from scripts.backtrader_four_stage_backtest import discover_db_codes, run_dsl_backtest
 
 
@@ -336,10 +337,49 @@ with st.form("bt_form"):
 
     c1, c2, c3, c4, c5 = st.columns(5)
     cash = c1.number_input("初始资金", min_value=1000.0, value=100000.0, step=10000.0, format="%.0f")
-    commission = c2.number_input("佣金比例", min_value=0.0, max_value=0.01, value=0.0003, step=0.0001, format="%.4f")
-    cash_buffer = c3.number_input("成交保护现金", min_value=0.0, max_value=0.2, value=0.05, step=0.01, format="%.2f")
-    c4.metric("策略回看", f"{selected_dsl.lookback} 日")
-    max_positions = c5.number_input("最大持仓数", min_value=1, max_value=20, value=5, step=1)
+    commission = c2.number_input(
+        "佣金比例（双边）",
+        min_value=0.0, max_value=0.01, value=0.0003, step=0.0001, format="%.4f",
+        help="买卖双向收取，A 股券商通常万二~万三",
+    )
+    stamp_duty = c3.number_input(
+        "印花税（仅卖）",
+        min_value=0.0, max_value=0.005, value=0.0005, step=0.0001, format="%.4f",
+        help="卖出单边收取，2023-08 起 A 股 0.05%",
+    )
+    slippage = c4.number_input(
+        "滑点比例",
+        min_value=0.0, max_value=0.02, value=0.001, step=0.0005, format="%.4f",
+        help="百分比滑点，模拟成交价偏离（涨跌停/低流动性更显著）。默认 0.1%",
+    )
+    cash_buffer = c5.number_input(
+        "保护金比例",
+        min_value=0.0, max_value=0.2, value=0.05, step=0.01, format="%.2f",
+        help="始终保留不投入的现金比例。A 股次日跳空高开 + 佣金可能导致满仓后下一笔被 Margin 拒单，留 5% 缓冲。",
+    )
+    st.caption(f"策略回看 {selected_dsl.lookback} 日")
+
+    # 交易规则：max_positions 由规则决定，不再单独暴露
+    trade_rules = trade_rule_repo.list_trade_rules()
+    rule_options = {f"📋 {r.name}": r.id for r in trade_rules}
+    rule_options["使用内置默认（不保存）"] = None
+    rule_label = st.selectbox(
+        "交易规则",
+        options=list(rule_options),
+        index=0,
+        help="持仓/退出规则（max_positions、止损、止盈、持股时间）。在「交易规则」页建规则。",
+    )
+    selected_rule_id = rule_options[rule_label]
+    selected_rule_spec = None
+    if selected_rule_id is not None:
+        try:
+            selected_rule_spec = trade_rule_repo.get_current_rule_spec(selected_rule_id)
+            if selected_rule_spec:
+                st.caption(f"规则：{rule_to_text(selected_rule_spec)}")
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"规则加载失败：{exc}")
+    # 未选规则时 fallback：max_positions=5（run_dsl_backtest 内部默认即 5）
+    max_positions = selected_rule_spec.max_positions if selected_rule_spec else 5
 
     benchmark_label = st.selectbox("基准", options=list(BENCHMARK_OPTIONS), index=0)
     benchmark_code = BENCHMARK_OPTIONS[benchmark_label]
@@ -372,12 +412,15 @@ if submitted:
 
     with st.spinner("Backtrader 回测运行中..."):
         try:
+            trade_rule_dict = selected_rule_spec.model_dump() if selected_rule_spec else None
             result = run_dsl_backtest(
                 strategy_id=selected_strategy_id,
                 db_path=str(DB_PATH),
                 codes=selected_codes,
                 cash=float(cash),
                 commission=float(commission),
+                stamp_duty=float(stamp_duty),
+                slippage=float(slippage),
                 max_positions=int(max_positions),
                 cash_buffer=float(cash_buffer),
                 fromdate=_to_ts(from_date),
@@ -385,6 +428,7 @@ if submitted:
                 max_codes=limit,
                 benchmark_code=benchmark_code,
                 pool_index_code=pool_index_code,
+                trade_rule_spec=trade_rule_dict,
                 printlog=False,
             )
         except Exception as exc:  # noqa: BLE001

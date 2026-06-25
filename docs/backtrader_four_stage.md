@@ -81,16 +81,16 @@ DSL 模式：
 - 使用所选策略当前版本的 `lookback` 和 `conditions`。
 - 信号由 `strategy_engine.evaluate_history()` 计算。
 - 当日收盘后生成信号，Backtrader 市价单在下一根 bar 执行。
-- 多只股票同时命中时，按代码顺序取前 `max_positions` 只。
+- 多只股票同时命中时，按代码顺序取前 `available = max_positions - 当前持仓数` 只。
 - 默认预留 5% 现金，避免下一交易日跳空上涨和佣金导致 Backtrader `Margin` 拒单。
 
-持仓规则：
+持仓/退出规则：
 
 - 每根日线 bar 调用一次 `next()`。
-- 读取当天 DSL 命中信号。
-- 最多持有 `max_positions` 只。
-- 不在目标列表中的持仓清仓。
-- 目标列表等权调仓。
+- **入场**：读 DSL 命中列表，受 `max_positions - 当前持仓` 约束。
+- **退出**：由交易规则（trade_rule）决定，**信号消失不再触发卖出**。
+- 卖出优先级：止损 > 止盈 > 时间到。三者均不触发则继续持有。
+- 仓位：每只 `position_pct × broker_value × (1 - cash_buffer)`。
 
 ## 基准 (benchmark)
 
@@ -129,6 +129,56 @@ CLI 等效：
 `_pair_orders_to_trades` 把订单层记录按 ts_code FIFO 配对成完整交易：
 回测结束时仍有未平仓 BUY，输出一条 `sell_date=None` 的记录，UI 标「未平仓」。
 持仓贡献 tab 按个股聚合 `交易次数 / 总盈亏 / 平均持仓天 / 贡献占比`，并按贡献排序画横向 bar。
+
+## 交易成本与滑点
+
+回测默认带入以下摩擦，使结果更贴近实盘：
+
+| 项 | 默认 | 收取 | 说明 |
+|---|---|---|---|
+| 佣金 | 0.0003（万三） | 双边 | 券商佣金，可调 |
+| 印花税 | 0.0005（0.05%） | 卖出单边 | A 股 2023-08 起税率；`StampDutyCommissionInfo` 重写 `getcommission`，size<0 时加收 |
+| 滑点 | 0.001（0.1%） | 双边 | 百分比滑点，`broker.set_slippage_perc`；模拟涨跌停/低流动性 |
+| 保护金 | 0.05（5%） | — | 现金缓冲，避免满仓跳空触发 Margin 拒单 |
+
+CLI：
+
+```bash
+.venv/bin/python scripts/backtrader_four_stage_backtest.py \
+  --db data/stock.db --strategy-id 5 \
+  --commission 0.0003 --stamp-duty 0.0005 --slippage 0.001
+```
+
+CSV 模式（`FourStagePullbackStrategy`）同样生效。
+
+## 交易规则（trade_rules）
+
+独立于策略 DSL，由 `pages/5_⏰_交易规则.py` 表单配置，回测时按 `trade_rule_id` 加载。
+
+字段（`TradeRuleSpec`，详见 `core/trade_rule_dsl.py`）：
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `max_positions` | 5 | 最多同时持有股票数 |
+| `position_pct` | 0.20 | 单只仓位占比（建议 = 1/max_positions） |
+| `max_holding_days` | 10 | 最大持股交易日数（time_stop 触发线） |
+| `stop_loss_pct` | 5.0 | 止损百分比 magnitude；None 表示不止损 |
+| `take_profit_pct` | 10.0 | 止盈百分比 magnitude；None 表示不止盈 |
+| `time_stop` | true | 到达 max_holding_days 时强平 |
+| `buy_time` | "09:35" | 日内买入时点；**回测忽略**（日线无日内价），仅记录实盘意图 |
+| `sell_time` | "14:55" | 日内卖出时点；**回测忽略**，仅记录实盘意图 |
+
+> ⚠️ **buy_time / sell_time 在回测里不生效**。日线数据没有日内价，所有订单统一按 backtrader 默认撮合：T 日 `next()` 用 T 日 close 决策（止损/止盈/时间到）→ Market 单在 T+1 日 open 成交。两字段仅记录实盘意图，未来接实盘时使用。
+
+语义：
+
+- **入库**：`trade_rules` + `trade_rule_versions` 两表（仿 `strategies`/`strategy_versions`），每条最多 5 版。
+- **回测**：选了规则后 `pages/4` 的「最大持仓数」禁用，由规则决定。
+- **未选规则**：用 `run_dsl_backtest` 内置 fallback（与默认字段一致），不写库。
+- **跨策略复用**：同一规则可用于任意策略回测；同一策略也可配多套规则对比参数。
+- **CLI**：`--trade-rule-id N`，未传则用 fallback。
+
+T+1 满足：买入在次日开盘价撮合，最早可卖为当日收盘 → 自然满足 T+1。
 
 ## 数据初始化（新机器 / 首次回测）
 
