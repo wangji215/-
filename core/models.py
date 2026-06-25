@@ -93,6 +93,20 @@ class DailyBar(Base):
     pct_chg = Column(Float)
 
 
+class IndexWeight(Base):
+    """指数成分股权重快照（tushare pro.index_weight）。
+
+    复合主键 (index_code, trade_date, ts_code)。同一指数在不同快照日成分会变，
+    回测时按 trade_date 用 step function（<=当日最新快照）决定可交易池。
+    """
+
+    __tablename__ = "index_weights"
+    index_code = Column(String, primary_key=True)
+    trade_date = Column(String, primary_key=True)  # YYYYMMDD 快照日
+    ts_code = Column(String, primary_key=True)
+    weight = Column(Float)
+
+
 class AnalysisRun(Base):
     """一次策略分析运行。"""
 

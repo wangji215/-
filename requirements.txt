@@ -7,3 +7,4 @@ sqlalchemy>=2.0
 apscheduler>=3.10
 pydantic>=2.6
 python-dotenv>=1.0
+backtrader==1.9.78.123

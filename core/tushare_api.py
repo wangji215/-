@@ -19,7 +19,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from core.config import apply_proxies, get_setting
 from core.db import get_session
-from core.models import DailyBar, Stock, TradeCal
+from core.models import DailyBar, IndexWeight, Stock, TradeCal
 
 _pro = None
 _pro_token = None
@@ -176,6 +176,165 @@ def ensure_bars_for_dates(trade_dates: List[str]) -> int:
         fetched += _persist_bars(df)
     # 抓取后即使某日无数据（停市），也以调用次数为准返回
     return len(missing)
+
+
+def fetch_index_daily(ts_code: str, start_date: str, end_date: str) -> int:
+    """抓取单只指数日线（YYYYMMDD 闭区间），写入 ``daily_bars`` 复用同一张表。
+
+    tushare ``pro.index_daily`` 必须按 ts_code 单只拉（不能像 ``pro.daily`` 那样按 trade_date 全市场）。
+    返回写入行数。字段与 ``pro.daily`` 同名同义，``_persist_bars`` 直接复用。
+    """
+    pro = _client()
+    _rate_limit()
+    df = pro.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+    return _persist_bars(df)
+
+
+def _cached_index_range(ts_code: str) -> tuple[str | None, str | None]:
+    """返回某 ts_code（含指数）已缓存的 (min_date, max_date)；无则 (None, None)。"""
+    with get_session() as s:
+        rows = (
+            s.query(DailyBar.trade_date)
+            .filter(DailyBar.ts_code == ts_code)
+            .order_by(DailyBar.trade_date.asc())
+            .all()
+        )
+    if not rows:
+        return None, None
+    return rows[0][0], rows[-1][0]
+
+
+def ensure_index_bars(ts_code: str, start_date: str, end_date: str) -> int:
+    """确保 [start_date, end_date] 内的指数日线已缓存，返回新写入行数。
+
+    只补缺口：若已缓存区间完全覆盖请求区间则直接返回 0；否则按缺口段拉取。
+    """
+    lo, hi = _cached_index_range(ts_code)
+    if lo is not None and hi is not None and lo <= start_date and hi >= end_date:
+        return 0
+    # 简化：只要不完全覆盖就重拉整段（指数单只单段，开销可接受）
+    return fetch_index_daily(ts_code, start_date, end_date)
+
+
+def fetch_index_weights(index_code: str, start_date: str, end_date: str) -> int:
+    """抓取指数成分股权重快照（tushare pro.index_weight），返回写入行数。
+
+    ``pro.index_weight`` 按 (index_code, start/end_date) 返回每日成分股 + 权重。
+    复合主键 (index_code, trade_date, ts_code) 自动幂等 upsert。
+    """
+    pro = _client()
+    _rate_limit()
+    df = pro.index_weight(index_code=index_code, start_date=start_date, end_date=end_date)
+    if df is None or df.empty:
+        return 0
+    # tushare index_weight 返回列：index_code, con_code, trade_date, weight
+    # con_code 即成分股 ts_code，统一写为 ts_code 入库
+    df = df.rename(columns={"con_code": "ts_code"})
+    cols = ["index_code", "trade_date", "ts_code", "weight"]
+    rows = [{c: r.get(c) for c in cols} for _, r in df.iterrows()]
+    BATCH = 100
+    total = len(rows)
+    with get_session() as s:
+        for i in range(0, total, BATCH):
+            batch = rows[i:i + BATCH]
+            stmt = sqlite_insert(IndexWeight.__table__).values(batch)
+            update_cols = {c: stmt.excluded[c] for c in cols if c not in ("index_code", "trade_date", "ts_code")}
+            stmt = stmt.on_conflict_do_update(index_elements=["index_code", "trade_date", "ts_code"], set_=update_cols)
+            s.execute(stmt)
+        s.commit()
+    return total
+
+
+def _cached_weight_snapshot_range(index_code: str) -> tuple[str | None, str | None]:
+    """返回某指数已缓存的 (最早快照日, 最晚快照日)；无则 (None, None)。"""
+    with get_session() as s:
+        rows = (
+            s.query(IndexWeight.trade_date)
+            .filter(IndexWeight.index_code == index_code)
+            .order_by(IndexWeight.trade_date.asc())
+            .all()
+        )
+    if not rows:
+        return None, None
+    return rows[0][0], rows[-1][0]
+
+
+def ensure_index_weights(index_code: str, start_date: str, end_date: str) -> int:
+    """确保 [start_date, end_date] 内指数成分权重已缓存，返回新写入行数。
+
+    与 ensure_index_bars 同款语义：完全覆盖则跳过；否则重拉整段。
+    """
+    lo, hi = _cached_weight_snapshot_range(index_code)
+    if lo is not None and hi is not None and lo <= start_date and hi >= end_date:
+        return 0
+    return fetch_index_weights(index_code, start_date, end_date)
+
+
+def index_snapshot_dates(index_code: str, start_date: str | None = None, end_date: str | None = None) -> List[str]:
+    """返回已缓存的快照日期升序列表（可按 [start_date, end_date] 过滤）。"""
+    with get_session() as s:
+        q = s.query(IndexWeight.trade_date).filter(IndexWeight.index_code == index_code)
+        if start_date:
+            q = q.filter(IndexWeight.trade_date >= start_date)
+        if end_date:
+            q = q.filter(IndexWeight.trade_date <= end_date)
+        rows = q.distinct().order_by(IndexWeight.trade_date.asc()).all()
+    return [r[0] for r in rows]
+
+
+def constituents_on(index_code: str, on_date: str) -> List[str]:
+    """返回 <= on_date 的最新一次快照成分股代码列表（无快照则空列表）。"""
+    with get_session() as s:
+        snap = (
+            s.query(IndexWeight.trade_date)
+            .filter(IndexWeight.index_code == index_code, IndexWeight.trade_date <= on_date)
+            .order_by(IndexWeight.trade_date.desc())
+            .first()
+        )
+        if snap is None:
+            return []
+        rows = (
+            s.query(IndexWeight.ts_code)
+            .filter(IndexWeight.index_code == index_code, IndexWeight.trade_date == snap[0])
+            .all()
+        )
+    return [r[0] for r in rows]
+
+
+def build_pool_map(index_code: str, trade_dates: List[str]) -> dict:
+    """对每个 trade_date，返回 <= 当日最新快照的成分股列表。
+
+    单次 SQL 拉所有相关快照，内存里 step function 查找。trade_dates 必须升序。
+    """
+    if not trade_dates:
+        return {}
+    lo = min(trade_dates)
+    hi = max(trade_dates)
+    with get_session() as s:
+        rows = (
+            s.query(IndexWeight.trade_date, IndexWeight.ts_code)
+            .filter(
+                IndexWeight.index_code == index_code,
+                IndexWeight.trade_date >= lo,
+                IndexWeight.trade_date <= hi,
+            )
+            .order_by(IndexWeight.trade_date.asc())
+            .all()
+        )
+    snap_to_codes: dict[str, list[str]] = {}
+    for snap_date, ts_code in rows:
+        snap_to_codes.setdefault(snap_date, []).append(ts_code)
+    sorted_snaps = sorted(snap_to_codes.keys())
+
+    pool_map: dict[str, list[str]] = {}
+    current_codes: list[str] = []
+    snap_idx = 0
+    for td in trade_dates:
+        while snap_idx < len(sorted_snaps) and sorted_snaps[snap_idx] <= td:
+            current_codes = snap_to_codes[sorted_snaps[snap_idx]]
+            snap_idx += 1
+        pool_map[td] = current_codes
+    return pool_map
 
 
 def get_lookback_dates(snapshot_date: str, lookback: int) -> List[str]:
