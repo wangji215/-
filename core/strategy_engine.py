@@ -245,8 +245,12 @@ def evaluate(dsl: StrategyDSL, bars: pd.DataFrame, snapshot_date: str) -> List[s
 
 
 def evaluate_history(dsl: StrategyDSL, bars: pd.DataFrame) -> pd.DataFrame:
-    """返回每个 (ts_code, trade_date) 是否命中（用于回测/可视化），列：ts_code,trade_date,matched。"""
-    out_rows = []
+    """返回每个 (ts_code, trade_date) 是否命中（用于回测/可视化），列：ts_code,trade_date,matched。
+
+    向量化：每只股票的布尔结果一次性组装成 DataFrame，避免逐行 iterrows+append
+    （全市场 ~5600 只 × 全周期会让纯 Python 行循环达到数分钟量级）。
+    """
+    frames = []
     for ts_code, g in bars.groupby("ts_code", sort=False):
         g = g.sort_values("trade_date")
         if g.empty:
@@ -257,10 +261,12 @@ def evaluate_history(dsl: StrategyDSL, bars: pd.DataFrame) -> pd.DataFrame:
             combined = flag if combined is None else (combined & flag)
         if combined is None:
             combined = pd.Series(False, index=g.index)
-        for idx, row in g.iterrows():
-            try:
-                hit = bool(combined.loc[idx])
-            except KeyError:
-                hit = False
-            out_rows.append({"ts_code": ts_code, "trade_date": row["trade_date"], "matched": hit})
-    return pd.DataFrame(out_rows)
+        matched = combined.fillna(False).astype(bool)
+        frames.append(pd.DataFrame({
+            "ts_code": ts_code,
+            "trade_date": g["trade_date"].to_numpy(),
+            "matched": matched.to_numpy(),
+        }))
+    if not frames:
+        return pd.DataFrame(columns=["ts_code", "trade_date", "matched"])
+    return pd.concat(frames, ignore_index=True)

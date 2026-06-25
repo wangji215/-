@@ -1118,6 +1118,20 @@ def run_dsl_backtest(
         }
         signal_map = {d: codes for d, codes in signal_map.items() if codes}
 
+    # 只给「出现过信号」的代码加 data feed：DslSignalStrategy 仅买卖 signal_map 里的代码，
+    # 零信号代码永不被交易/持仓，加成 feed 纯属负担。backtrader 为 O(feed×bar) 纯 Python，
+    # 全市场 ~5600 feed 会让 cerebro.run() 长时间不可终止；收窄到有信号的代码即可秒级完成。
+    # 持仓必来自历史信号 → 任意已持仓代码都在该集合内，卖出遍历 self.datas 不会漏。
+    signaled_codes = {str(c) for codes in signal_map.values() for c in codes}
+    if signaled_codes:
+        feed_frame = bars_for_bt[bars_for_bt["ts_code"].astype(str).isin(signaled_codes)]
+    else:
+        # 整段无信号：用第一只票作回测时钟，净值持平，避免全市场 feed 拖慢
+        clock_code = str(bars_for_bt["ts_code"].iloc[0])
+        feed_frame = bars_for_bt[bars_for_bt["ts_code"].astype(str) == clock_code]
+    if feed_frame.empty:
+        feed_frame = bars_for_bt  # 兜底：保证至少有一个 feed
+
     cerebro = build_dsl_cerebro(
         signal_map,
         cash=cash,
@@ -1131,7 +1145,7 @@ def run_dsl_backtest(
         trade_rule=trade_rule_spec,
         printlog=printlog,
     )
-    loaded = add_db_data_feeds_from_frame(cerebro, bars_for_bt)
+    loaded = add_db_data_feeds_from_frame(cerebro, feed_frame)
 
     start_value = cerebro.broker.getvalue()
     results = cerebro.run()
