@@ -378,7 +378,8 @@ with st.form("bt_form"):
                 st.caption(f"规则：{rule_to_text(selected_rule_spec)}")
         except Exception as exc:  # noqa: BLE001
             st.warning(f"规则加载失败：{exc}")
-    # 未选规则时 fallback：max_positions=5（run_dsl_backtest 内部默认即 5）
+    # 选了规则时：max_positions 由规则决定（run_dsl_backtest 内 strategy 从 rule 取）
+    # 未选规则时：fallback 给 param.max_positions
     max_positions = selected_rule_spec.max_positions if selected_rule_spec else 5
 
     benchmark_label = st.selectbox("基准", options=list(BENCHMARK_OPTIONS), index=0)
@@ -413,7 +414,8 @@ if submitted:
     with st.spinner("Backtrader 回测运行中..."):
         try:
             trade_rule_dict = selected_rule_spec.model_dump() if selected_rule_spec else None
-            result = run_dsl_backtest(
+            # 选了规则时，max_positions 由规则决定，不透传避免重复（D1）
+            kwargs = dict(
                 strategy_id=selected_strategy_id,
                 db_path=str(DB_PATH),
                 codes=selected_codes,
@@ -421,7 +423,6 @@ if submitted:
                 commission=float(commission),
                 stamp_duty=float(stamp_duty),
                 slippage=float(slippage),
-                max_positions=int(max_positions),
                 cash_buffer=float(cash_buffer),
                 fromdate=_to_ts(from_date),
                 todate=_to_ts(to_date),
@@ -431,6 +432,9 @@ if submitted:
                 trade_rule_spec=trade_rule_dict,
                 printlog=False,
             )
+            if trade_rule_dict is None:
+                kwargs["max_positions"] = int(max_positions)
+            result = run_dsl_backtest(**kwargs)
         except Exception as exc:  # noqa: BLE001
             st.error(f"回测失败：{exc}")
             st.stop()

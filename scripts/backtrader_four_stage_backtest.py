@@ -198,6 +198,10 @@ class DslSignalStrategy(bt.Strategy):
         self._positions_meta: dict[str, dict] = {}
         # 回测内见过的交易日（YYYYMMDD 升序），用于计算 hold_days
         self._seen_dates: list[str] = []
+        # 当根 next() 已提交卖单的 name 集合，用于计算「卖出后真实可用仓位」。
+        # backtrader 默认 Market 单在下一根 bar 才成交，当根 position.size 不变，
+        # 直接 count 会把「即将卖掉」的票也算进占用，导致同日新信号被错误抑制。
+        self._pending_sells_today: set[str] = set()
 
     def log(self, message):
         if self.p.printlog and self.datas:
@@ -207,11 +211,15 @@ class DslSignalStrategy(bt.Strategy):
         return _date_from_data(data).strftime("%Y%m%d") == trade_date
 
     def _hold_days(self, buy_date_str: str, current_date_str: str) -> int:
-        """基于回测内见过的交易日列表算间隔（买入当日=0）。"""
+        """基于回测内见过的交易日列表算已持仓天数（买入当根 bar=1）。
+
+        返回值含买入当日，与用户语义一致：max_holding_days=N 表示持 N 个交易日。
+        buy_date_str 不在 _seen_dates 时（数据异常）返回 1，保守允许 time_stop 触发。
+        """
         try:
-            return self._seen_dates.index(current_date_str) - self._seen_dates.index(buy_date_str)
+            return self._seen_dates.index(current_date_str) - self._seen_dates.index(buy_date_str) + 1
         except ValueError:
-            return 0
+            return 1
 
     def next(self):
         if not self.datas:
@@ -227,13 +235,24 @@ class DslSignalStrategy(bt.Strategy):
         if trade_date not in self._seen_dates:
             self._seen_dates.append(trade_date)
 
-        rule = self.p.trade_rule or {}
+        # trade_rule 兼容 dict / TradeRuleSpec 对象（D2）
+        rule_in = self.p.trade_rule
+        if rule_in is None:
+            rule = {}
+        elif isinstance(rule_in, dict):
+            rule = rule_in
+        else:
+            # TradeRuleSpec 等 pydantic 对象
+            rule = rule_in.model_dump() if hasattr(rule_in, "model_dump") else dict(rule_in)
         max_positions = int(rule.get("max_positions", self.p.max_positions))
         stop_loss_pct = rule.get("stop_loss_pct")     # magnitude，None=不止损
         take_profit_pct = rule.get("take_profit_pct") # magnitude，None=不止盈
         max_holding_days = int(rule.get("max_holding_days", 0))
         time_stop = bool(rule.get("time_stop", True))
         position_pct = float(rule.get("position_pct", 1.0 / max(1, max_positions)))
+
+        # 当根 bar 的 pending sells 重置（B1 修复）
+        self._pending_sells_today = set()
 
         signal_map = self.p.signal_map or {}
         signal_codes = list(signal_map.get(trade_date, []))
@@ -276,15 +295,19 @@ class DslSignalStrategy(bt.Strategy):
                 reason = "time_stop"
             if should_sell:
                 self.order_target_value(data=data, target=0.0)
+                self._pending_sells_today.add(data._name)  # B1：标记当根已提交卖
                 self.log("SELL trigger=%s %s hold=%dd pnl=%.2f%%" % (reason, data._name, hold_days, pnl_pct * 100))
 
-        # 2. 买入检查：先算空仓位数
-        current_positions = sum(1 for d in self.datas if self.getposition(d).size > 0)
-        available = max_positions - current_positions
+        # 2. 买入检查：扣掉当根 pending sells 后的真实空仓（B1）
+        active_positions = sum(
+            1 for d in self.datas
+            if self.getposition(d).size > 0 and d._name not in self._pending_sells_today
+        )
+        available = max_positions - active_positions
         if available <= 0:
             return
 
-        # 从今日信号里挑出（a）有当日 bar 的（b）当前未持仓的，取前 available 只
+        # 从今日信号里挑出（a）有当日 bar 的（b）当前未持仓且未在 pending sell 的，取前 available 只
         target_datas = []
         for name in signal_codes:
             if name not in self._data_by_name:
@@ -292,7 +315,7 @@ class DslSignalStrategy(bt.Strategy):
             data = self._data_by_name[name]
             if not self._is_current_bar(data, trade_date):
                 continue
-            if self.getposition(data).size > 0:
+            if self.getposition(data).size > 0 and name not in self._pending_sells_today:
                 continue
             target_datas.append(data)
             if len(target_datas) >= available:
