@@ -130,6 +130,38 @@ CLI 等效：
 回测结束时仍有未平仓 BUY，输出一条 `sell_date=None` 的记录，UI 标「未平仓」。
 持仓贡献 tab 按个股聚合 `交易次数 / 总盈亏 / 平均持仓天 / 贡献占比`，并按贡献排序画横向 bar。
 
+## 数据初始化（新机器 / 首次回测）
+
+`data/stock.db` 已 gitignore（~330MB），新机器或首次跑 Backtrader 回测前需手动补齐：
+
+1. **stocks**：股票基础信息，用于名称查询（如「中国平安」→ `601318.SH`）。
+2. **trade_cal**：交易日历，回看窗口与 T+1..T+5 偏移计算依赖此表。
+3. **daily_bars**：全市场日线。最重的一项——按 `trade_date` 逐日抓取，每秒 ~3 天，1 年约 250 次调用。
+4. **daily_bars（指数）**：基准净值用；`000300.SH` 等 ts_code 与个股共用同一张表。
+5. **index_weights**：动态股票池（沪深300 / 中证500 等成分股）用。
+
+### CLI 一键初始化
+
+```bash
+python -m scripts.bootstrap_backtest_data --from 20240601 --to 20260624
+```
+
+可选参数：
+- `--indices 000300.SH,000905.SH`：指定指数子集（默认全部 4 个）
+- `--skip-stocks` / `--skip-bars` / `--skip-index-bars` / `--skip-index-weights`：跳过某一项
+
+幂等：已缓存的不会重复抓。结束后打印各表行数。
+
+### UI 按钮
+
+`环境设置` 页底部「📥 回测数据初始化」expander 提供同样 4 个按钮，适合手动分步触发（如先看 `stocks` 是否成功，再拉 `daily_bars`）。
+
+### 指标预热（lookback）
+
+DSL 策略的 `lookback`（如 60）需要前置数据。若从 `20250624` 起跑回测，`daily_bars`
+至少要回溯到 `20250624 - lookback*2 天`。CLI 会按起止区间拉对应范围；如回测仍出现
+「前 N 天无信号 / 净值恒为 1」，先确认 `daily_bars` 起点是否早于回测 `fromdate`。
+
 ## 当前本地数据注意
 
 本地 `daily_bars` 是 Tushare 日线缓存，不包含聚宽的指数成分、停牌状态、涨跌停、

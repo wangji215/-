@@ -62,6 +62,69 @@ if tc2.button("🔄 刷新股票列表缓存"):
         except Exception as e:  # noqa: BLE001
             st.error(f"失败：{e}")
 
+# ---------------- 数据初始化（回测前置） ----------------
+with st.expander("📥 回测数据初始化（按日期范围批量缓存）", expanded=False):
+    st.caption(
+        "新机器或首次跑 Backtrader 回测前用。逐项补齐：交易日历 → 全市场 daily_bars → "
+        "指数日线（基准）→ 指数成分股权重（动态股票池）。幂等，已缓存的会跳过。"
+    )
+    bc1, bc2 = st.columns(2)
+    bar_from = bc1.text_input("起始日 YYYYMMDD", value="20240601", key="bar_from")
+    bar_to = bc2.text_input("结束日 YYYYMMDD", value="20260624", key="bar_to")
+
+    bt_idx = st.text_input(
+        "指数 ts_code 列表",
+        value="000300.SH,000016.SH,399006.SZ,000905.SH",
+        help="逗号分隔；前两个用于基准/池，可任意子集",
+    )
+
+    bc3, bc4, bc5 = st.columns(3)
+    if bc3.button("📅 拉交易日历", help="fetch_trade_cal，秒级"):
+        try:
+            n = tushare_api.fetch_trade_cal(bar_from, bar_to)
+            st.success(f"交易日历缓存 {n} 行")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"失败：{e}")
+
+    if bc4.button("📊 拉全市场 daily_bars", help="最重的一步，~1 次/交易日，1 年约 250 次调用"):
+        try:
+            days = tushare_api.trading_days_between(bar_from, bar_to)
+            if not days:
+                st.warning("无交易日，请先拉交易日历")
+            else:
+                with st.spinner(f"补 {len(days)} 个交易日（每秒 ~3 天）..."):
+                    n = tushare_api.ensure_bars_for_dates(days)
+                st.success(f"补齐 {n} 个交易日的全市场日线")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"失败：{e}")
+
+    if bc5.button("📈 拉指数日线", help="基准用；4 个指数共 4 次调用"):
+        try:
+            codes = [c.strip() for c in bt_idx.split(",") if c.strip()]
+            msgs = []
+            for code in codes:
+                n = tushare_api.ensure_index_bars(code, bar_from, bar_to)
+                msgs.append(f"{code}: +{n}")
+            st.success("；".join(msgs))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"失败：{e}")
+
+    if st.button("🗂 拉指数成分股权重", help="动态池用；每指数 1 次调用，秒级"):
+        try:
+            codes = [c.strip() for c in bt_idx.split(",") if c.strip()]
+            msgs = []
+            for code in codes:
+                n = tushare_api.ensure_index_weights(code, bar_from, bar_to)
+                msgs.append(f"{code}: +{n}")
+            st.success("；".join(msgs))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"失败：{e}")
+
+    st.caption(
+        "CLI 等效（适合 CI/批量初始化）：\n"
+        "`python -m scripts.bootstrap_backtest_data --from 20240601 --to 20260624`"
+    )
+
 # ---------------- 大模型 ----------------
 st.subheader("3. 大模型（OpenAI 兼容接口）")
 with st.form("llm_form"):
