@@ -315,7 +315,13 @@ class DslSignalStrategy(bt.Strategy):
             data = self._data_by_name[name]
             if not self._is_current_bar(data, trade_date):
                 continue
-            if self.getposition(data).size > 0 and name not in self._pending_sells_today:
+            # 当前已持仓 或 当根正在平仓（pending sell）→ 不再买入。
+            # 注意：这里必须是 or 不是 and——若写成 `size>0 and not in pending`，
+            # 「持仓 + 在 pending」的票（正好是当日 time_stop/止损 平仓的对象）会漏过守卫，
+            # 进而在买入循环里再次对它下 order_target_value；而该股若已上涨、市值超过目标市值，
+            # backtrader 算出的 size 为负 → 反向卖出一小笔，与平仓单叠加后超过持仓量，
+            # 凭空制造空头并一路传播（被误报为「未平仓 / 强平失效」）。A 股 T+1 本就不允许同日卖后再买。
+            if self.getposition(data).size > 0 or name in self._pending_sells_today:
                 continue
             target_datas.append(data)
             if len(target_datas) >= available:
@@ -719,9 +725,13 @@ def _pair_orders_to_trades(order_records):
     输出 list[{code, buy_date, buy_price, sell_date, sell_price, size, pnl, pnl_pct, hold_days}]。
     回测结束时未平仓的 BUY 输出为 sell_date/sell_price/pnl/hold_days = None，UI 标「未平仓」。
     部分 SELL 超 BUY（数据异常）跳过。
+
+    仅配对实际成交(Completed)的订单：Margin/Canceled/Rejected 的买单从未建仓，
+    若计入会制造「永远未平仓」的幻影仓位，被误判为止损/强平失效。
     """
+    fills = [o for o in order_records if o.get("status", "Completed") == "Completed"]
     by_code: dict[str, list[dict]] = {}
-    for o in order_records:
+    for o in fills:
         by_code.setdefault(o["code"], []).append(o)
 
     trades: list[dict] = []
