@@ -5,7 +5,7 @@
 
 - 入场信号：仍由 core.strategy_engine.evaluate_history 提供（每日 DSL 命中）
 - 持仓/退出：由本规则的 stop_loss / take_profit / max_holding_days / time_stop 决定
-- 卖出优先级：止损 > 止盈 > 时间到。**信号消失不再触发卖出**。
+- 卖出优先级：止损 > 止盈 > 跌破5日线 > 放量 > 时间到。**信号消失不再触发卖出**。
 - buy_time/sell_time：日内 HH:MM 时点；回测精度日线，近似为「次日开盘买/当日收盘卖」。
 """
 from __future__ import annotations
@@ -26,6 +26,8 @@ class TradeRuleSpec(BaseModel):
     max_holding_days: int = Field(10, ge=1, le=250, description="最大持股交易日数，到则强平（time_stop 开启时生效）")
     stop_loss_pct: Optional[float] = Field(5.0, ge=0, le=50, description="止损百分比 magnitude；None 表示不止损")
     take_profit_pct: Optional[float] = Field(10.0, ge=0, le=200, description="止盈百分比 magnitude；None 表示不止盈")
+    stop_loss_below_ma5: bool = Field(False, description="收盘跌破 5 日均线时止损卖出；False 不启用")
+    volume_spike_mult: Optional[float] = Field(None, ge=1.0, le=20.0, description="放量卖出倍数：当日量 > 前3日均量×倍数 则卖出；None 不启用")
     time_stop: bool = Field(True, description="到达 max_holding_days 时强平")
     buy_time: str = Field("09:35", description="日内买入时点 HH:MM；回测忽略（日线数据无日内价），仅记录实盘意图")
     sell_time: str = Field("14:55", description="日内卖出时点 HH:MM；回测忽略（日线数据无日内价），仅记录实盘意图")
@@ -48,6 +50,10 @@ def rule_to_text(spec: TradeRuleSpec) -> str:
         parts.append(f"止损 {spec.stop_loss_pct:.1f}%")
     if spec.take_profit_pct is not None:
         parts.append(f"止盈 {spec.take_profit_pct:.1f}%")
+    if spec.stop_loss_below_ma5:
+        parts.append("跌破5日线卖")
+    if spec.volume_spike_mult is not None:
+        parts.append(f"放量≥{spec.volume_spike_mult:.1f}倍卖")
     if spec.time_stop:
         parts.append(f"到 {spec.max_holding_days} 日强平")
     parts.append(f"买 {spec.buy_time} / 卖 {spec.sell_time}")

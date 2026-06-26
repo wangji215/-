@@ -55,6 +55,13 @@ with left:
         take_profit_pct = c8.number_input("止盈 %", min_value=0.0, max_value=200.0, value=10.0, step=1.0,
                                           disabled=tp_off, help="涨幅达到该值时卖出")
 
+        st.markdown("**技术面 / 量能退出**（勾选「关闭」表示不启用）")
+        e1, e2, e3 = st.columns([1, 1, 1])
+        ma5_off = e1.checkbox("跌破五日线关闭", value=False, help="启用后：当日收盘 < 5日均线 → 卖出")
+        vol_off = e2.checkbox("放量关闭", value=False, help="启用后：当日成交量 > 前3日均量×倍数 → 卖出")
+        volume_spike_mult = e3.number_input("放量倍数 x", min_value=1.0, max_value=20.0, value=2.0, step=0.5,
+                                            disabled=vol_off, help="当日量 > 前3日均量 × x 则卖出（前3日不含当日）")
+
         st.markdown(
             "**执行时点**（⚠️ 回测忽略这两个字段——日线数据无日内价，"
             "所有订单统一按 backtrader 默认撮合：T 日 close 决策 → T+1 日 open 成交。"
@@ -76,6 +83,8 @@ with left:
                 "max_holding_days": int(max_holding_days),
                 "stop_loss_pct": None if sl_off else float(stop_loss_pct),
                 "take_profit_pct": None if tp_off else float(take_profit_pct),
+                "stop_loss_below_ma5": not ma5_off,
+                "volume_spike_mult": None if vol_off else float(volume_spike_mult),
                 "time_stop": bool(time_stop),
                 "buy_time": buy_time.strip(),
                 "sell_time": sell_time.strip(),

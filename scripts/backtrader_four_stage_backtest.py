@@ -221,6 +221,26 @@ class DslSignalStrategy(bt.Strategy):
         except ValueError:
             return 1
 
+    def _below_ma5(self, data) -> bool:
+        """收盘跌破 5 日均线（含当日的 5 日 MA）；不足 5 根 bar 视为不触发。"""
+        closes = np.array(data.close.get(size=5), dtype=float)
+        if closes.size < 5:
+            return False
+        return float(data.close[0]) < float(closes.mean())
+
+    def _volume_spike(self, data, mult: float) -> bool:
+        """当日量 > 前 3 个交易日均量 × mult。
+
+        前 3 日不含当日（取 get(size=4) 的前 3 个值）；均量为 0 或不足 4 根 bar 不触发。
+        """
+        vols = np.array(data.volume.get(size=4), dtype=float)
+        if vols.size < 4:
+            return False
+        avg_prev3 = float(vols[:3].mean())
+        if avg_prev3 <= 0:
+            return False
+        return float(vols[-1]) > mult * avg_prev3
+
     def next(self):
         if not self.datas:
             return
@@ -247,6 +267,8 @@ class DslSignalStrategy(bt.Strategy):
         max_positions = int(rule.get("max_positions", self.p.max_positions))
         stop_loss_pct = rule.get("stop_loss_pct")     # magnitude，None=不止损
         take_profit_pct = rule.get("take_profit_pct") # magnitude，None=不止盈
+        stop_loss_below_ma5 = bool(rule.get("stop_loss_below_ma5", False))
+        volume_spike_mult = rule.get("volume_spike_mult")  # None=不启用
         max_holding_days = int(rule.get("max_holding_days", 0))
         time_stop = bool(rule.get("time_stop", True))
         position_pct = float(rule.get("position_pct", 1.0 / max(1, max_positions)))
@@ -290,6 +312,12 @@ class DslSignalStrategy(bt.Strategy):
             elif take_profit_pct is not None and pnl_pct >= float(take_profit_pct) / 100.0:
                 should_sell = True
                 reason = "take_profit"
+            elif stop_loss_below_ma5 and self._below_ma5(data):
+                should_sell = True
+                reason = "ma5_stop"
+            elif volume_spike_mult is not None and self._volume_spike(data, volume_spike_mult):
+                should_sell = True
+                reason = "volume_spike"
             elif time_stop and max_holding_days > 0 and hold_days >= max_holding_days:
                 should_sell = True
                 reason = "time_stop"

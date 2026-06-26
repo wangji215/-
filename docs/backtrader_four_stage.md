@@ -89,7 +89,7 @@ DSL 模式：
 - 每根日线 bar 调用一次 `next()`。
 - **入场**：读 DSL 命中列表，受 `max_positions - 当前持仓` 约束。
 - **退出**：由交易规则（trade_rule）决定，**信号消失不再触发卖出**。
-- 卖出优先级：止损 > 止盈 > 时间到。三者均不触发则继续持有。
+- 卖出优先级：止损 > 止盈 > 跌破5日线 > 放量 > 时间到。均不触发则继续持有。
 - 仓位：每只 `position_pct × broker_value × (1 - cash_buffer)`。
 
 ## 基准 (benchmark)
@@ -163,7 +163,9 @@ CSV 模式（`FourStagePullbackStrategy`）同样生效。
 | `position_pct` | 0.20 | 单只仓位占比（建议 = 1/max_positions） |
 | `max_holding_days` | 10 | 最大持股交易日数（time_stop 触发线） |
 | `stop_loss_pct` | 5.0 | 止损百分比 magnitude；None 表示不止损 |
-| `take_profit_pct` | 10.0 | 止盈百分比 magnitude；None 表示不止盈 |
+| `take_profit_pct` | 10.0 | 止盈百分比 magnitude；None 表示止盈 |
+| `stop_loss_below_ma5` | false | 收盘跌破 5 日均线时卖出；false 不启用 |
+| `volume_spike_mult` | null | 放量卖出倍数：当日量 > 前3日均量×倍数 则卖出；null 不启用 |
 | `time_stop` | true | 到达 max_holding_days 时强平 |
 | `buy_time` | "09:35" | 日内买入时点；**回测忽略**（日线无日内价），仅记录实盘意图 |
 | `sell_time` | "14:55" | 日内卖出时点；**回测忽略**，仅记录实盘意图 |
