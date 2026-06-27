@@ -3,7 +3,8 @@
 设计要点：
 - 股票列表缓存到 ``stocks`` 表。
 - 日 K 按 ``trade_date`` 全市场抓取（``pro.daily(trade_date=...)`` 一次返回当日全部股票），
-  缓存到 ``daily_bars``，命中则不重复抓，避免按票逐个调用。
+  缓存到 ``daily_bars``（**后复权 hfq**：价格 × ``pro.adj_factor``，pct_chg 按后复权 close 重算；
+  vol/amount 保留真实成交），命中则不重复抓，避免按票逐个调用。
 - 令牌桶限流，超限自动等待。
 - 交易日历缓存到 ``trade_cal``，用于回看窗口与 T+1..T+5 偏移计算。
 """
@@ -137,7 +138,7 @@ def _persist_bars(df: pd.DataFrame) -> int:
     """upsert 日 K 到缓存，返回写入行数。"""
     if df is None or df.empty:
         return 0
-    cols = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount", "pct_chg"]
+    cols = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount", "pct_chg", "adj_factor"]
     rows = [{c: r.get(c) for c in cols} for _, r in df.iterrows()]
     # SQLite 单条语句变量数默认上限 999；9 列 × 每批 100 行 = 900，留出余量，
     # 否则整市场单日约 5000+ 只股票会触发 too many SQL variables。
@@ -159,23 +160,84 @@ def _cached_trade_dates() -> set:
         return {r[0] for r in s.query(DailyBar.trade_date).distinct().all()}
 
 
+def _prev_trade_date(d: str) -> str | None:
+    """返回 trade_cal 中 < d 的最大开市日（YYYYMMDD），无则 None。"""
+    with get_session() as s:
+        row = (
+            s.query(TradeCal.cal_date)
+            .filter(TradeCal.cal_date < d, TradeCal.is_open.is_(True))
+            .order_by(TradeCal.cal_date.desc())
+            .first()
+        )
+    return row[0] if row else None
+
+
+def _recompute_pct_chg(df: pd.DataFrame, d: str) -> pd.Series:
+    """用上一交易日缓存的 hfq close 重算当日 pct_chg（%）。无上一交易日的票返回 NaN。
+
+    df 的 close 此时已是当日 hfq close；prev_close 取自缓存（同为 hfq），比值即真实日涨跌。
+    """
+    d_prev = _prev_trade_date(d)
+    nan = pd.Series([float("nan")] * len(df), index=df.index)
+    if d_prev is None:
+        return nan
+    with get_session() as s:
+        prev_rows = s.query(DailyBar.ts_code, DailyBar.close).filter(DailyBar.trade_date == d_prev).all()
+    if not prev_rows:
+        return nan
+    prev_close = pd.DataFrame(prev_rows, columns=["ts_code", "close"]).rename(columns={"close": "prev_close"})
+    merged = df[["ts_code", "close"]].merge(prev_close, on="ts_code", how="left")
+    return (merged["close"].astype(float) / merged["prev_close"] - 1.0) * 100.0
+
+
 def ensure_bars_for_dates(trade_dates: List[str]) -> int:
-    """确保给定交易日（YYYYMMDD）的日 K 已缓存，返回新抓取的天数。"""
+    """确保给定交易日（YYYYMMDD）的日 K 已缓存（后复权 hfq），返回新抓取的天数。
+
+    每个交易日：``pro.daily``（不复权 OHLC，整市场）× ``pro.adj_factor``（整市场复权因子）→
+    价格后复权化（vol/amount 不动）；pct_chg 按当日 hfq close / 上一交易日 hfq close 重算，
+    使除权日不产生跳空。missing 按日期升序处理，保证算 pct_chg 时上一交易日已缓存。
+    """
     trade_dates = [d for d in trade_dates if d]
     if not trade_dates:
         return 0
     cached = _cached_trade_dates()
-    missing = [d for d in trade_dates if d not in cached]
+    missing = sorted(d for d in trade_dates if d not in cached)
     if not missing:
         return 0
     pro = _client()
-    fetched = 0
     for d in missing:
         _rate_limit()
         df = pro.daily(trade_date=d)
-        fetched += _persist_bars(df)
+        if df is None or df.empty:
+            continue
+        # 整市场复权因子；缺失填 1.0（极个别无因子的票按不复权处理）
+        _rate_limit()
+        af = pro.adj_factor(trade_date=d)
+        if af is not None and not af.empty:
+            df = df.merge(af[["ts_code", "adj_factor"]], on="ts_code", how="left")
+        else:
+            df["adj_factor"] = 1.0
+        df["adj_factor"] = df["adj_factor"].fillna(1.0)
+        # 后复权化价格（量额保留真实成交，不动）
+        for col in ("open", "high", "low", "close"):
+            df[col] = (df[col].astype(float) * df["adj_factor"]).round(4)
+        # 重算 pct_chg 与 hfq close 一致
+        df["pct_chg"] = _recompute_pct_chg(df, d)
+        _persist_bars(df)
     # 抓取后即使某日无数据（停市），也以调用次数为准返回
     return len(missing)
+
+
+def clear_daily_bars() -> int:
+    """清空 daily_bars 缓存（保留表结构），返回删除行数。
+
+    切换复权方式后必须先清空再重拉，否则新旧数据（不复权 / 后复权）混在同一张表会得到错误结果。
+    """
+    with get_session() as s:
+        n = s.query(DailyBar).count()
+        s.query(DailyBar).delete()
+        s.commit()
+    return n
 
 
 def fetch_index_daily(ts_code: str, start_date: str, end_date: str) -> int:

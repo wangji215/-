@@ -3,15 +3,17 @@
 用法：
     python -m scripts.bootstrap_backtest_data --from 20240601 --to 20260624
     python -m scripts.bootstrap_backtest_data --from 20240101 --to 20260624 --indices 000300.SH,000905.SH
+    # 切换复权方式时：先清空再按后复权重补全段
+    python -m scripts.bootstrap_backtest_data --from 20240601 --to 20260624 --clear-bars
 
 依次补齐：
 1. stocks（股票基础信息，用于名称查询）
 2. trade_cal（交易日历）
-3. daily_bars（全市场日线，按 trade_date 拉全市场，最大头）
-4. 指数日线（daily_bars 表，与个股同 schema）
+3. daily_bars（全市场**后复权 hfq** 日线，按 trade_date 拉全市场，最大头）
+4. 指数日线（daily_bars 表，与个股同 schema；指数无复权）
 5. 指数成分股权重（index_weights 表）
 
-幂等：已缓存的不会重复拉。
+幂等：已缓存的不会重复拉。切换复权方式须加 --clear-bars 先清空，避免新旧数据混存。
 """
 from __future__ import annotations
 
@@ -36,6 +38,11 @@ def _parse_args():
     )
     p.add_argument("--skip-stocks", action="store_true", help="Skip stock_basic refresh")
     p.add_argument("--skip-bars", action="store_true", help="Skip daily_bars backfill")
+    p.add_argument(
+        "--clear-bars",
+        action="store_true",
+        help="Clear daily_bars before backfill (切换复权方式时用：先清空再按后复权重补全段)",
+    )
     p.add_argument("--skip-index-bars", action="store_true", help="Skip index OHLCV backfill")
     p.add_argument("--skip-index-weights", action="store_true", help="Skip index weight backfill")
     return p.parse_args()
@@ -77,11 +84,13 @@ def main():
     )
 
     if not args.skip_bars:
+        if args.clear_bars:
+            _step("clear daily_bars", tushare_api.clear_daily_bars)
         trade_days = tushare_api.trading_days_between(args.from_date, args.to_date)
         print(f"  trade_days in range: {len(trade_days)}", flush=True)
         if trade_days:
             _step(
-                f"daily_bars ({len(trade_days)} days)",
+                f"daily_bars ({len(trade_days)} days, hfq)",
                 tushare_api.ensure_bars_for_dates,
                 trade_days,
             )

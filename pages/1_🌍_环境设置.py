@@ -65,7 +65,7 @@ if tc2.button("🔄 刷新股票列表缓存"):
 # ---------------- 数据初始化（回测前置） ----------------
 with st.expander("📥 回测数据初始化（按日期范围批量缓存）", expanded=False):
     st.caption(
-        "新机器或首次跑 Backtrader 回测前用。逐项补齐：交易日历 → 全市场 daily_bars → "
+        "新机器或首次跑 Backtrader 回测前用。逐项补齐：交易日历 → 全市场 daily_bars（后复权 hfq）→ "
         "指数日线（基准）→ 指数成分股权重（动态股票池）。幂等，已缓存的会跳过。"
     )
     bc1, bc2 = st.columns(2)
@@ -86,7 +86,7 @@ with st.expander("📥 回测数据初始化（按日期范围批量缓存）", 
         except Exception as e:  # noqa: BLE001
             st.error(f"失败：{e}")
 
-    if bc4.button("📊 拉全市场 daily_bars", help="最重的一步，~1 次/交易日，1 年约 250 次调用"):
+    if bc4.button("📊 拉全市场 daily_bars", help="最重的一步，~2 次/交易日（日线+复权因子），1 年约 500 次调用；后复权 hfq"):
         try:
             days = tushare_api.trading_days_between(bar_from, bar_to)
             if not days:
@@ -94,7 +94,7 @@ with st.expander("📥 回测数据初始化（按日期范围批量缓存）", 
             else:
                 with st.spinner(f"补 {len(days)} 个交易日（每秒 ~3 天）..."):
                     n = tushare_api.ensure_bars_for_dates(days)
-                st.success(f"补齐 {n} 个交易日的全市场日线")
+                st.success(f"补齐 {n} 个交易日的全市场日线（后复权）")
         except Exception as e:  # noqa: BLE001
             st.error(f"失败：{e}")
 
@@ -108,6 +108,22 @@ with st.expander("📥 回测数据初始化（按日期范围批量缓存）", 
             st.success("；".join(msgs))
         except Exception as e:  # noqa: BLE001
             st.error(f"失败：{e}")
+
+    st.markdown("**🔄 切换复权 / 修正历史**：先清空 daily_bars 再按后复权重抓（首次切换复权方式时必须执行一次，否则新旧数据混存会出错）")
+    with st.popover("🔄 清空并按后复权重拉", use_container_width=True):
+        st.warning("会先删除全部 daily_bars 再按【后复权】重新抓取，耗时较长。")
+        if st.button("确认：清空并重拉", type="primary", key="clear_refetch_bars"):
+            try:
+                days = tushare_api.trading_days_between(bar_from, bar_to)
+                if not days:
+                    st.error("无交易日，请先拉交易日历")
+                else:
+                    cleared = tushare_api.clear_daily_bars()
+                    with st.spinner(f"已清空 {cleared:,} 行，重抓 {len(days)} 个交易日（每秒 ~3 天）..."):
+                        n = tushare_api.ensure_bars_for_dates(days)
+                    st.success(f"已清空旧数据，按后复权重抓 {n} 个交易日")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"失败：{e}")
 
     if st.button("🗂 拉指数成分股权重", help="动态池用；每指数 1 次调用，秒级"):
         try:

@@ -116,7 +116,12 @@ class TradeCal(Base):
 
 
 class DailyBar(Base):
-    """日 K 缓存，按交易日全市场抓取。复合主键 (ts_code, trade_date)。"""
+    """日 K 缓存，按交易日全市场抓取。复合主键 (ts_code, trade_date)。
+
+    价格为**后复权 hfq**：抓取时用 ``pro.daily``（不复权）× ``pro.adj_factor`` 就地相乘后入库，
+    因此 open/high/low/close 已是后复权价，pct_chg 也按后复权 close 重算（除权日不跳空）。
+    vol/amount 保留真实成交（量额不复权）。adj_factor 同步入库便于核对/重新推导。
+    """
 
     __tablename__ = "daily_bars"
     ts_code = Column(String, primary_key=True)
@@ -128,6 +133,7 @@ class DailyBar(Base):
     vol = Column(Float)
     amount = Column(Float)
     pct_chg = Column(Float)
+    adj_factor = Column(Float)
 
 
 class IndexWeight(Base):

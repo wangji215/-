@@ -45,12 +45,14 @@ def _ensure_column(table: str, column: str, ddl_type: str = "TEXT DEFAULT ''") -
 
 
 def _migrate() -> None:
-    """轻量幂等迁移：给历史库补版本表的 description 列，并回填策略版本说明。
+    """轻量幂等迁移：给历史库补版本表的 description 列、daily_bars 的 adj_factor 列，并回填策略版本说明。
 
-    新库由 create_all 直接建出含 description 的表，此处对老库做 ALTER + 一次性回填。
+    新库由 create_all 直接建出含新列的表，此处对老库做 ALTER + 一次性回填。
     """
     added_sv = _ensure_column("strategy_versions", "description")
     _ensure_column("trade_rule_versions", "description")
+    # daily_bars 复权因子列（老库补列；老行 adj_factor 为 NULL，需清空后按后复权重拉）
+    _ensure_column("daily_bars", "adj_factor", "FLOAT")
     if added_sv:
         # 老数据 description 为 NULL，从 spec_json 顶层 description 回填（spec_json 即 StrategyDSL）
         with engine.begin() as conn:
