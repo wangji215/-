@@ -220,10 +220,13 @@ FEW_SHOTS = [
 ]
 
 
-def build_messages(dialog_history: list[dict], reference: str | None = None) -> list[dict]:
-    """组装发给大模型的消息：system [+参考样本股] + few-shot + 历史对话。
+def build_messages(dialog_history: list[dict], reference: str | None = None,
+                   current_dsl=None) -> list[dict]:
+    """组装发给大模型的消息：system [+参考样本股] + few-shot [+当前策略] + 历史对话。
 
     reference 为样本股参考文本时，作为一条独立 system 消息注入（纯文本，无代码栏）。
+    current_dsl 非空时（多轮优化场景），把当前策略的精确 JSON 作为 system 消息注入，
+    使模型在既有规则基础上修改，而不是凭摘要重新发明——这是「上下文记忆」的核心。
     """
     msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     if reference:
@@ -231,5 +234,19 @@ def build_messages(dialog_history: list[dict], reference: str | None = None) -> 
     for shot in FEW_SHOTS:
         msgs.append({"role": "user", "content": shot["user"]})
         msgs.append({"role": "assistant", "content": shot["assistant"]})
+    if current_dsl is not None:
+        dsl_json = (
+            current_dsl.model_dump_json(indent=2)
+            if hasattr(current_dsl, "model_dump_json")
+            else str(current_dsl)
+        )
+        msgs.append({
+            "role": "system",
+            "content": (
+                "这是当前策略的 compiled_dsl JSON。用户接下来的要求是在此基础上**优化**："
+                "保留用户未提及的既有规则，只改动与新要求相关的部分，输出完整 JSON。\n"
+                "```json\n" + dsl_json + "\n```"
+            ),
+        })
     msgs.extend(dialog_history)
     return msgs

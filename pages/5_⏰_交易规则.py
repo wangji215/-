@@ -15,6 +15,15 @@ from core import trade_rule_repo
 from core.db import init_db
 from core.trade_rule_dsl import TradeRuleSpec, rule_to_text
 
+
+def _pretty_json(s: str) -> str:
+    """紧凑 spec_json 美化为可读缩进 JSON，便于在文本框里编辑。"""
+    try:
+        return json.dumps(json.loads(s), ensure_ascii=False, indent=2)
+    except (ValueError, TypeError):
+        return s or ""
+
+
 init_db()
 
 st.set_page_config(page_title="交易规则", page_icon="⏰", layout="wide")
@@ -93,7 +102,7 @@ with left:
                 spec = TradeRuleSpec(**spec_dict)
                 existing = [r for r in trade_rule_repo.list_trade_rules() if r.name == name.strip()]
                 if existing:
-                    trade_rule_repo.add_version(existing[0].id, spec)
+                    trade_rule_repo.add_version(existing[0].id, spec, description=description)
                     st.toast(f"已为「{name}」新增版本")
                 else:
                     rule = trade_rule_repo.create_trade_rule(name.strip(), description, spec)
@@ -129,15 +138,43 @@ with right:
             for v in versions:
                 is_cur = (r.current_version_id == v.id)
                 tag = "（当前）" if is_cur else ""
-                ca, cb = st.columns([3, 1])
-                ca.caption(f"v{v.version_no}{tag}  ·  {v.created_at.strftime('%Y-%m-%d %H:%M')}")
-                if cb.button("回滚", key=f"rbr_{v.id}", disabled=is_cur, help="把该版本置为当前（作为新版本写入）"):
+                st.caption(
+                    f"v{v.version_no}{tag}  ·  {v.created_at.strftime('%Y-%m-%d %H:%M')}"
+                    f"  ·  {v.description or '无说明'}"
+                )
+                vca, vcb, vcc = st.columns(3)
+                if vca.button("回滚", key=f"rbr_{v.id}", disabled=is_cur,
+                              help="把当前版本指针切到该版本（不新建版本、不改编号）"):
                     try:
                         trade_rule_repo.rollback_to(r.id, v.id)
-                        st.toast("已回滚")
+                        st.toast(f"已切换到 v{v.version_no}")
                         st.rerun()
                     except trade_rule_repo.TradeRuleError as e:
                         st.error(str(e))
+                with vcb.popover("更新", key=f"rup_{v.id}", help="就地编辑版本说明 / 规则 JSON"):
+                    new_desc = st.text_input("版本说明", value=v.description or "", key=f"rupd_{v.id}")
+                    new_spec = st.text_area(
+                        "规则 JSON", value=_pretty_json(v.spec_json), height=220, key=f"rups_{v.id}"
+                    )
+                    if st.button("保存", key=f"rupsb_{v.id}", type="primary"):
+                        try:
+                            TradeRuleSpec.model_validate_json(new_spec)  # 先校验
+                            trade_rule_repo.update_version(v.id, spec=new_spec, description=new_desc)
+                            st.toast("已更新")
+                            st.rerun()
+                        except trade_rule_repo.TradeRuleError as e:
+                            st.error(str(e))
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"校验失败：{e}")
+                with vcc.popover("删除", key=f"rvdl_{v.id}"):
+                    st.warning("删除后不可恢复")
+                    if st.button("确认删除", key=f"rvdlb_{v.id}"):
+                        try:
+                            trade_rule_repo.delete_version(r.id, v.id)
+                            st.toast("已删除版本")
+                            st.rerun()
+                        except trade_rule_repo.TradeRuleError as e:
+                            st.error(str(e))
 
             if st.button("删除", key=f"rdl_{r.id}"):
                 trade_rule_repo.delete_trade_rule(r.id)

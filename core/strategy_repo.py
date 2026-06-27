@@ -1,7 +1,8 @@
 """策略与版本仓库：CRUD、5 版本上限、回滚、启用管理。
 
 - 每条策略最多保留 5 个版本；新增第 6 版时删除最旧版并把其余 version_no 前移。
-- 回滚 = 把目标版本的 spec 拷为「新版本」写入（保留历史轨迹），并置为当前。
+- 回滚 = 直接把 current_version_id 指针切到目标版本（不新建版本、不改 version_no）。
+- 每个版本自带 description；父表 Strategy.description 始终同步为「当前版本」的说明。
 - 启用上限 3 条（MAX_ACTIVE）。
 """
 from __future__ import annotations
@@ -36,6 +37,20 @@ def _normalize_spec(spec) -> str:
         except json.JSONDecodeError:
             raise StrategyError("spec 不是合法 JSON")
     raise StrategyError(f"不支持的 spec 类型: {type(spec)}")
+
+
+def _extract_description(spec) -> str:
+    """从 spec 提取 description：StrategyDSL 取 .description；dict/JSON 字符串取顶层 description。"""
+    if isinstance(spec, StrategyDSL):
+        return spec.description or ""
+    if isinstance(spec, dict):
+        return str(spec.get("description") or "")
+    if isinstance(spec, str):
+        try:
+            return str(json.loads(spec).get("description") or "")
+        except (ValueError, TypeError):
+            return ""
+    return ""
 
 
 def list_strategies() -> List[Strategy]:
@@ -86,11 +101,12 @@ def get_current_dsl(strategy_id: int) -> Optional[StrategyDSL]:
 
 def create_strategy(name: str, description: str, spec) -> Strategy:
     spec_json = _normalize_spec(spec)
+    desc = (description or _extract_description(spec)) or ""
     with get_session() as s:
-        st = Strategy(name=name, description=description or "", active=False)
+        st = Strategy(name=name, description=desc, active=False)
         s.add(st)
         s.flush()
-        v = StrategyVersion(strategy_id=st.id, version_no=1, spec_json=spec_json)
+        v = StrategyVersion(strategy_id=st.id, version_no=1, spec_json=spec_json, description=desc)
         s.add(v)
         s.flush()
         st.current_version_id = v.id
@@ -100,9 +116,15 @@ def create_strategy(name: str, description: str, spec) -> Strategy:
         return st
 
 
-def add_version(strategy_id: int, spec) -> StrategyVersion:
-    """新增版本：超过 MAX_VERSIONS 则淘汰最旧并把后续前移。"""
+def add_version(strategy_id: int, spec, description: Optional[str] = None) -> StrategyVersion:
+    """新增版本：超过 MAX_VERSIONS 则淘汰最旧并把后续前移。
+
+    description 为 None 时从 spec 提取（StrategyDSL.description）。新版本成为当前版本，
+    父表 Strategy.description 同步为该版本说明。
+    """
     spec_json = _normalize_spec(spec)
+    desc = description if description is not None else _extract_description(spec)
+    desc = desc or ""
     with get_session() as s:
         st = s.query(Strategy).filter_by(id=strategy_id).first()
         if not st:
@@ -126,10 +148,11 @@ def add_version(strategy_id: int, spec) -> StrategyVersion:
                 v.version_no = i
             s.flush()
         next_no = (versions[-1].version_no + 1) if versions else 1
-        v = StrategyVersion(strategy_id=strategy_id, version_no=next_no, spec_json=spec_json)
+        v = StrategyVersion(strategy_id=strategy_id, version_no=next_no, spec_json=spec_json, description=desc)
         s.add(v)
         s.flush()
         st.current_version_id = v.id
+        st.description = desc
         s.commit()
         s.refresh(v)
         _ = v.spec_json
@@ -137,12 +160,81 @@ def add_version(strategy_id: int, spec) -> StrategyVersion:
 
 
 def rollback_to(strategy_id: int, version_id: int) -> StrategyVersion:
-    """把指定版本的 spec 作为新版本写入并置为当前（保留历史）。"""
+    """把当前版本指针切到目标版本（不新建版本、不改 version_no），并同步父表说明。"""
     with get_session() as s:
+        st = s.query(Strategy).filter_by(id=strategy_id).first()
+        if not st:
+            raise StrategyError("策略不存在")
         target = s.query(StrategyVersion).filter_by(id=version_id).first()
         if not target or target.strategy_id != strategy_id:
             raise StrategyError("目标版本不存在")
-    return add_version(strategy_id, target.spec_json)
+        st.current_version_id = target.id
+        st.description = target.description or ""
+        s.commit()
+        s.refresh(target)
+        _ = target.spec_json
+        return target
+
+
+def update_version(version_id: int, spec=None, description: Optional[str] = None) -> StrategyVersion:
+    """就地更新某版本的 spec 和/或 description。
+
+    spec 非 None 时经 _normalize_spec 校验后覆盖；description 非 None 时覆盖。
+    若该版本是某策略的当前版本，同步父表 Strategy.description。
+    """
+    spec_json = _normalize_spec(spec) if spec is not None else None
+    with get_session() as s:
+        v = s.query(StrategyVersion).filter_by(id=version_id).first()
+        if not v:
+            raise StrategyError("版本不存在")
+        if spec_json is not None:
+            v.spec_json = spec_json
+        if description is not None:
+            v.description = description
+        # 若是当前版本，同步父表说明
+        st = s.query(Strategy).filter_by(current_version_id=version_id).first()
+        if st and (description is not None or spec_json is not None):
+            # 优先用新 description；否则维持原版本 description（spec 改了但说明没给时不变）
+            st.description = v.description or ""
+        s.commit()
+        s.refresh(v)
+        _ = v.spec_json
+        return v
+
+
+def delete_version(strategy_id: int, version_id: int) -> None:
+    """删除某个非当前版本，并把剩余版本按 version_no 升序重编号为 1..N。
+
+    至少保留 1 个版本；不能删除当前启用版本（请先回滚到其他版本）。
+    """
+    with get_session() as s:
+        st = s.query(Strategy).filter_by(id=strategy_id).first()
+        if not st:
+            raise StrategyError("策略不存在")
+        v = s.query(StrategyVersion).filter_by(id=version_id).first()
+        if not v or v.strategy_id != strategy_id:
+            raise StrategyError("版本不存在")
+        versions = (
+            s.query(StrategyVersion)
+            .filter_by(strategy_id=strategy_id)
+            .order_by(StrategyVersion.version_no.asc())
+            .all()
+        )
+        if len(versions) <= 1:
+            raise StrategyError("至少保留一个版本，无法删除")
+        if st.current_version_id == version_id:
+            raise StrategyError("不能删除当前启用版本，请先回滚到其他版本")
+        s.delete(v)
+        s.flush()
+        remaining = (
+            s.query(StrategyVersion)
+            .filter_by(strategy_id=strategy_id)
+            .order_by(StrategyVersion.version_no.asc())
+            .all()
+        )
+        for i, rv in enumerate(remaining, start=1):
+            rv.version_no = i
+        s.commit()
 
 
 def set_active(strategy_id: int, active: bool) -> None:

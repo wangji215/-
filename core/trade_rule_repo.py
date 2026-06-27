@@ -2,7 +2,8 @@
 
 仿 core/strategy_repo.py 范式，去掉 active / MAX_ACTIVE（trade_rule 无启用上限概念）。
 - 每条规则最多保留 5 个版本；新增第 6 版时删除最旧版并把其余 version_no 前移。
-- 回滚 = 把目标版本的 spec 拷为「新版本」写入（保留历史轨迹），并置为当前。
+- 回滚 = 直接把 current_version_id 指针切到目标版本（不新建版本、不改 version_no）。
+- 每个版本自带 description；父表 TradeRule.description 始终同步为「当前版本」的说明。
 """
 from __future__ import annotations
 
@@ -86,11 +87,12 @@ def get_current_rule_spec(rule_id: int) -> Optional[TradeRuleSpec]:
 
 def create_trade_rule(name: str, description: str, spec) -> TradeRule:
     spec_json = _normalize_spec(spec)
+    desc = description or ""
     with get_session() as s:
-        rule = TradeRule(name=name, description=description or "")
+        rule = TradeRule(name=name, description=desc)
         s.add(rule)
         s.flush()
-        v = TradeRuleVersion(rule_id=rule.id, version_no=1, spec_json=spec_json)
+        v = TradeRuleVersion(rule_id=rule.id, version_no=1, spec_json=spec_json, description=desc)
         s.add(v)
         s.flush()
         rule.current_version_id = v.id
@@ -100,9 +102,14 @@ def create_trade_rule(name: str, description: str, spec) -> TradeRule:
         return rule
 
 
-def add_version(rule_id: int, spec) -> TradeRuleVersion:
-    """新增版本：超过 MAX_VERSIONS 则淘汰最旧并把后续前移。"""
+def add_version(rule_id: int, spec, description: Optional[str] = None) -> TradeRuleVersion:
+    """新增版本：超过 MAX_VERSIONS 则淘汰最旧并把后续前移。
+
+    description 为 None 时默认空串（TradeRuleSpec 无 description 字段）。新版本成为当前版本，
+    父表 TradeRule.description 同步为该版本说明。
+    """
     spec_json = _normalize_spec(spec)
+    desc = (description or "") if description is not None else ""
     with get_session() as s:
         rule = s.query(TradeRule).filter_by(id=rule_id).first()
         if not rule:
@@ -124,10 +131,11 @@ def add_version(rule_id: int, spec) -> TradeRuleVersion:
                 v.version_no = i
             s.flush()
         next_no = (versions[-1].version_no + 1) if versions else 1
-        v = TradeRuleVersion(rule_id=rule_id, version_no=next_no, spec_json=spec_json)
+        v = TradeRuleVersion(rule_id=rule_id, version_no=next_no, spec_json=spec_json, description=desc)
         s.add(v)
         s.flush()
         rule.current_version_id = v.id
+        rule.description = desc
         s.commit()
         s.refresh(v)
         _ = v.spec_json
@@ -135,12 +143,79 @@ def add_version(rule_id: int, spec) -> TradeRuleVersion:
 
 
 def rollback_to(rule_id: int, version_id: int) -> TradeRuleVersion:
-    """把指定版本的 spec 作为新版本写入并置为当前（保留历史）。"""
+    """把当前版本指针切到目标版本（不新建版本、不改 version_no），并同步父表说明。"""
     with get_session() as s:
+        rule = s.query(TradeRule).filter_by(id=rule_id).first()
+        if not rule:
+            raise TradeRuleError("交易规则不存在")
         target = s.query(TradeRuleVersion).filter_by(id=version_id).first()
         if not target or target.rule_id != rule_id:
             raise TradeRuleError("目标版本不存在")
-    return add_version(rule_id, target.spec_json)
+        rule.current_version_id = target.id
+        rule.description = target.description or ""
+        s.commit()
+        s.refresh(target)
+        _ = target.spec_json
+        return target
+
+
+def update_version(version_id: int, spec=None, description: Optional[str] = None) -> TradeRuleVersion:
+    """就地更新某版本的 spec 和/或 description。
+
+    spec 非 None 时经 _normalize_spec 校验后覆盖；description 非 None 时覆盖。
+    若该版本是某规则的当前版本，同步父表 TradeRule.description。
+    """
+    spec_json = _normalize_spec(spec) if spec is not None else None
+    with get_session() as s:
+        v = s.query(TradeRuleVersion).filter_by(id=version_id).first()
+        if not v:
+            raise TradeRuleError("版本不存在")
+        if spec_json is not None:
+            v.spec_json = spec_json
+        if description is not None:
+            v.description = description
+        rule = s.query(TradeRule).filter_by(current_version_id=version_id).first()
+        if rule and (description is not None or spec_json is not None):
+            rule.description = v.description or ""
+        s.commit()
+        s.refresh(v)
+        _ = v.spec_json
+        return v
+
+
+def delete_version(rule_id: int, version_id: int) -> None:
+    """删除某个非当前版本，并把剩余版本按 version_no 升序重编号为 1..N。
+
+    至少保留 1 个版本；不能删除当前启用版本（请先回滚到其他版本）。
+    """
+    with get_session() as s:
+        rule = s.query(TradeRule).filter_by(id=rule_id).first()
+        if not rule:
+            raise TradeRuleError("交易规则不存在")
+        v = s.query(TradeRuleVersion).filter_by(id=version_id).first()
+        if not v or v.rule_id != rule_id:
+            raise TradeRuleError("版本不存在")
+        versions = (
+            s.query(TradeRuleVersion)
+            .filter_by(rule_id=rule_id)
+            .order_by(TradeRuleVersion.version_no.asc())
+            .all()
+        )
+        if len(versions) <= 1:
+            raise TradeRuleError("至少保留一个版本，无法删除")
+        if rule.current_version_id == version_id:
+            raise TradeRuleError("不能删除当前启用版本，请先回滚到其他版本")
+        s.delete(v)
+        s.flush()
+        remaining = (
+            s.query(TradeRuleVersion)
+            .filter_by(rule_id=rule_id)
+            .order_by(TradeRuleVersion.version_no.asc())
+            .all()
+        )
+        for i, rv in enumerate(remaining, start=1):
+            rv.version_no = i
+        s.commit()
 
 
 def delete_trade_rule(rule_id: int) -> None:

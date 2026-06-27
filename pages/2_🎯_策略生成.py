@@ -35,6 +35,14 @@ def _from_ymd(s: str) -> date:
     return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
 
 
+def _pretty_json(s: str) -> str:
+    """紧凑 spec_json 美化为可读缩进 JSON，便于在文本框里编辑。"""
+    try:
+        return json.dumps(json.loads(s), ensure_ascii=False, indent=2)
+    except (ValueError, TypeError):
+        return s or ""
+
+
 def _render_generation_preview(generation: StrategyGenerationResult | None) -> None:
     if generation is None:
         return
@@ -138,9 +146,7 @@ with left:
                 existing = [s for s in strategy_repo.list_strategies() if s.name == name]
                 try:
                     if existing:
-                        strategy_repo.add_version(existing[0].id, dsl)
-                        strategy_repo.get_strategy(existing[0].id)  # touch
-                        # 更新说明
+                        strategy_repo.add_version(existing[0].id, dsl, description=desc)
                         st.toast(f"已为「{name}」新增版本")
                     else:
                         strategy_repo.create_strategy(name, desc, dsl)
@@ -151,10 +157,8 @@ with left:
                     st.rerun()
                 except strategy_repo.StrategyError as e:
                     st.error(str(e))
-            if cs2.button("✏️ 继续修改"):
-                st.session_state.pending_dsl = None
-                st.session_state.pending_generation = None
-                st.session_state.pending_warning = ""
+            if cs2.button("✏️ 继续优化", help="保留当前策略作为优化基础，在下方对话里继续打磨；要全新开始请点「清空对话」"):
+                # 保留 pending_dsl 作为 LLM 的优化基础（不清空），仅滚动到对话区
                 st.rerun()
 
     user_input = st.chat_input("描述你的图形策略，例如：均线多头排列且MACD金叉...")
@@ -190,6 +194,7 @@ with left:
                     st.session_state.dlg,
                     sample_codes=codes_for_ref,
                     ref_start=ref_start, ref_end=ref_end, ref_buy=ref_buy,
+                    current_dsl=st.session_state.pending_dsl,
                 )
         # 记录助手回复（若有 DSL，回放里展示可读说明而非裸 JSON）
         if dsl is not None:
@@ -231,15 +236,55 @@ with right:
             for v in versions:
                 is_cur = (st_row.current_version_id == v.id)
                 tag = "（当前）" if is_cur else ""
-                col_a, col_b = st.columns([3, 1])
-                col_a.caption(f"v{v.version_no}{tag}  ·  {v.created_at.strftime('%Y-%m-%d %H:%M')}")
-                if col_b.button("回滚", key=f"rb_{v.id}", disabled=is_cur, help="把该版本置为当前（作为新版本写入）"):
+                st.caption(
+                    f"v{v.version_no}{tag}  ·  {v.created_at.strftime('%Y-%m-%d %H:%M')}"
+                    f"  ·  {v.description or '无说明'}"
+                )
+                vca, vcb, vcc, vcd = st.columns(4)
+                if vca.button("回滚", key=f"rb_{v.id}", disabled=is_cur,
+                              help="把当前版本指针切到该版本（不新建版本、不改编号）"):
                     try:
                         strategy_repo.rollback_to(st_row.id, v.id)
-                        st.toast("已回滚")
+                        st.toast(f"已切换到 v{v.version_no}")
                         st.rerun()
                     except strategy_repo.StrategyError as e:
                         st.error(str(e))
+                if vcb.button("优化", key=f"op_{v.id}", disabled=is_cur,
+                              help="载入该版本到对话区，基于它继续用 LLM 优化"):
+                    try:
+                        st.session_state.pending_dsl = StrategyDSL.model_validate_json(v.spec_json)
+                        st.session_state.pending_generation = None
+                        st.session_state.pending_warning = ""
+                        st.session_state.pending_raw = ""
+                        st.session_state.dlg = []  # 干净起步，以该版本为优化基础
+                        st.toast(f"已载入 v{v.version_no} 作为优化基础，在左侧对话继续修改")
+                        st.rerun()
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"载入失败：{e}")
+                with vcc.popover("更新", key=f"up_{v.id}", help="就地编辑版本说明 / 规则 JSON"):
+                    new_desc = st.text_input("版本说明", value=v.description or "", key=f"upd_{v.id}")
+                    new_spec = st.text_area(
+                        "规则 JSON", value=_pretty_json(v.spec_json), height=180, key=f"ups_{v.id}"
+                    )
+                    if st.button("保存", key=f"upsb_{v.id}", type="primary"):
+                        try:
+                            StrategyDSL.model_validate_json(new_spec)  # 先校验
+                            strategy_repo.update_version(v.id, spec=new_spec, description=new_desc)
+                            st.toast("已更新")
+                            st.rerun()
+                        except strategy_repo.StrategyError as e:
+                            st.error(str(e))
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"校验失败：{e}")
+                with vcd.popover("删除", key=f"vdl_{v.id}"):
+                    st.warning("删除后不可恢复")
+                    if st.button("确认删除", key=f"vdlb_{v.id}"):
+                        try:
+                            strategy_repo.delete_version(st_row.id, v.id)
+                            st.toast("已删除版本")
+                            st.rerun()
+                        except strategy_repo.StrategyError as e:
+                            st.error(str(e))
 
             bc1, bc2, bc3 = st.columns(3)
             if bc1.button("启用" if not st_row.active else "停用", key=f"tg_{st_row.id}",

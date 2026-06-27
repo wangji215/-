@@ -45,13 +45,17 @@ class Strategy(Base):
 
 
 class StrategyVersion(Base):
-    """策略的某一版本 DSL。每条策略最多保留 5 版。"""
+    """策略的某一版本 DSL。每条策略最多保留 5 版。
+
+    每个版本自带 description，切换/回滚版本时各自保留说明（不再只存父表一份）。
+    """
 
     __tablename__ = "strategy_versions"
     id = Column(Integer, primary_key=True)
     strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=False)
     version_no = Column(Integer, nullable=False)
     spec_json = Column(Text, nullable=False)
+    description = Column(Text, default="")
     created_at = Column(DateTime, default=_now)
     __table_args__ = (
         UniqueConstraint("strategy_id", "version_no", name="uq_sv_strategy_version"),
@@ -74,13 +78,17 @@ class TradeRule(Base):
 
 
 class TradeRuleVersion(Base):
-    """交易规则的某一版本。spec_json 由 TradeRuleSpec（core/trade_rule_dsl.py）校验。"""
+    """交易规则的某一版本。spec_json 由 TradeRuleSpec（core/trade_rule_dsl.py）校验。
+
+    每个版本自带 description，切换/回滚时各自保留说明。
+    """
 
     __tablename__ = "trade_rule_versions"
     id = Column(Integer, primary_key=True)
     rule_id = Column(Integer, ForeignKey("trade_rules.id"), nullable=False)
     version_no = Column(Integer, nullable=False)
     spec_json = Column(Text, nullable=False)
+    description = Column(Text, default="")
     created_at = Column(DateTime, default=_now)
     __table_args__ = (
         UniqueConstraint("rule_id", "version_no", name="uq_trv_rule_version"),

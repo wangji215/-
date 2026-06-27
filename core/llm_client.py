@@ -71,7 +71,8 @@ def generate_strategy(dialog_history: list[dict],
                       sample_codes: Optional[list[str]] = None,
                       ref_start: Optional[str] = None,
                       ref_end: Optional[str] = None,
-                      ref_buy: Optional[str] = None
+                      ref_buy: Optional[str] = None,
+                      current_dsl: Optional[StrategyDSL] = None
                       ) -> tuple[str, Optional[StrategyDSL], Optional[StrategyGenerationResult], Optional[str]]:
     """根据对话历史生成策略。
 
@@ -82,12 +83,15 @@ def generate_strategy(dialog_history: list[dict],
     sample_codes 非空时，先构建样本股参考文本注入 prompt，使策略贴合真实样本。
     ref_start/ref_end/ref_buy（YYYYMMDD）给出时进入「窗口+买点」模式：以买点当日为目标态、
     窗口走势作校准，供模型以标注样本优化策略。
+
+    current_dsl 非空时（多轮优化），注入为 system 上下文，使模型在既有规则基础上精确修改，
+    而非凭历史摘要重新发明——这是「持续对话优化」的上下文记忆来源。
     """
     reference = (
         build_sample_reference(sample_codes, start=ref_start, end=ref_end, buy_date=ref_buy)
         if sample_codes else None
     )
-    messages = build_messages(dialog_history, reference)
+    messages = build_messages(dialog_history, reference, current_dsl=current_dsl)
     prompt_text = _user_text(dialog_history)
     raw = chat(messages, temperature=0)
     dsl, generation, parse_err = _parse_strategy_raw(raw)

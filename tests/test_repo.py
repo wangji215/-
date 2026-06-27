@@ -65,17 +65,60 @@ def test_version_limit_and_rollback():
         R.add_version(st.id, _spec(p))
     versions = R.get_versions(st.id)
     assert len(versions) == R.MAX_VERSIONS, f"应保留 {R.MAX_VERSIONS} 版，实际 {len(versions)}"
-    # 当前应为最新
-    cur = R.get_current_spec(st.id)
-    dsl = StrategyDSL.model_validate_json(cur)
-    assert dsl.conditions[0].rules[0]["left"]["period"] if False else True
-    # 回滚到最旧版本
+    # 回滚到最旧版本：指针切换，不新建版本
     oldest = min(versions, key=lambda v: v.version_no)
-    new_v = R.rollback_to(st.id, oldest.id)
-    assert new_v.id != oldest.id
+    rolled = R.rollback_to(st.id, oldest.id)
+    assert rolled.id == oldest.id, "回滚应返回目标版本本身（指针切换），而非新建版本"
     after = R.get_versions(st.id)
-    assert len(after) <= R.MAX_VERSIONS
-    print(f"[ok] test_version_limit_and_rollback（保留 {len(after)} 版，回滚成功）")
+    assert len(after) == len(versions), "回滚不应改变版本数量"
+    # 当前指针已切到 oldest，spec 一致
+    assert R.get_strategy(st.id).current_version_id == oldest.id
+    assert R.get_current_spec(st.id) == oldest.spec_json
+    # 父表 description 同步为该版本说明
+    assert R.get_strategy(st.id).description == (oldest.description or "")
+    print(f"[ok] test_version_limit_and_rollback（保留 {len(after)} 版，指针回滚成功）")
+
+
+def test_update_and_delete_version():
+    st = R.create_strategy("版本测试UD", "更新删除", _spec(5))
+    created_ids.append(st.id)
+    R.add_version(st.id, _spec(6), description="v2说明")
+    R.add_version(st.id, _spec(7), description="v3说明")
+    by_no = {v.version_no: v for v in R.get_versions(st.id)}
+    assert len(by_no) == 3
+    assert by_no[2].description == "v2说明", "每个版本应自带 description"
+    # 更新中间版本（v2，非当前）：改 description + spec
+    R.update_version(by_no[2].id, spec=_spec(16), description="v2改后")
+    refreshed = {v.version_no: v for v in R.get_versions(st.id)}
+    assert refreshed[2].description == "v2改后"
+    # spec 校验：非法 spec 应抛错
+    try:
+        R.update_version(by_no[2].id, spec="not-a-json")
+        raise AssertionError("应拒绝非法 spec")
+    except R.StrategyError:
+        pass
+    # 删除中间版本（v2），剩余按 version_no 重编号为 1..N
+    R.delete_version(st.id, by_no[2].id)
+    after = R.get_versions(st.id)
+    assert len(after) == 2
+    assert sorted(v.version_no for v in after) == [1, 2]
+    # 不能删唯一版本
+    st_single = R.create_strategy("版本测试UD2", "单版", _spec(5))
+    created_ids.append(st_single.id)
+    only = R.get_versions(st_single.id)[0]
+    try:
+        R.delete_version(st_single.id, only.id)
+        raise AssertionError("应拒绝删除唯一版本")
+    except R.StrategyError:
+        pass
+    # 不能删当前版本
+    cur_id = R.get_strategy(st.id).current_version_id
+    try:
+        R.delete_version(st.id, cur_id)
+        raise AssertionError("应拒绝删除当前版本")
+    except R.StrategyError:
+        pass
+    print("[ok] test_update_and_delete_version")
 
 
 def test_active_limit():
@@ -116,6 +159,7 @@ if __name__ == "__main__":
         test_version_limit_and_rollback()
         test_active_limit()
         test_dsl_roundtrip()
+        test_update_and_delete_version()
         print("\n全部数据层测试通过 ✅")
     finally:
         for sid in created_ids:
