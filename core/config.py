@@ -24,6 +24,7 @@ DEFAULTS: Dict[str, str] = {
     "tushare_token": os.getenv("TUSHARE_TOKEN", ""),
     "tushare_enabled": "true",
     "tushare_rate_per_min": "200",
+    "tushare_timeout": "120",  # 单次请求超时（秒）；全市场查询偶发慢，调大 + 重试更稳
     # 大模型
     "llm_base_url": os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
     "llm_api_key": os.getenv("LLM_API_KEY", ""),
@@ -82,7 +83,11 @@ def save_settings(data: Dict[str, str]) -> None:
 
 
 def apply_proxies() -> None:
-    """把代理设置写入 os.environ，供 tushare(requests) / openai(httpx) 使用。"""
+    """把代理设置写入 os.environ，供 tushare(requests) / openai(httpx) 使用。
+
+    tushare 是国内服务（api.tushare.pro），若被强制走境外代理会因绕路超时；
+    故把 tushare 与本地地址加入 NO_PROXY 直连，而 LLM / GitHub 等境外服务仍走代理。
+    """
     http_p = get_setting("http_proxy")
     https_p = get_setting("https_proxy")
     if http_p:
@@ -93,3 +98,7 @@ def apply_proxies() -> None:
         os.environ["HTTPS_PROXY"] = https_p
     else:
         os.environ.pop("HTTPS_PROXY", None)
+    # 国内 / 本地地址直连，避免 tushare 被误代理导致超时
+    no_proxy = "localhost,127.0.0.1,.tushare.pro,tushare.pro,waditu.com"
+    os.environ["NO_PROXY"] = no_proxy
+    os.environ["no_proxy"] = no_proxy  # requests/httpx 部分路径认小写

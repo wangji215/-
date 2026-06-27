@@ -16,6 +16,7 @@ from typing import List
 
 import pandas as pd
 import tushare as ts
+from requests.exceptions import RequestException
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from core.config import apply_proxies, get_setting
@@ -24,6 +25,7 @@ from core.models import DailyBar, IndexWeight, Stock, TradeCal
 
 _pro = None
 _pro_token = None
+_pro_timeout = None
 _last_call = 0.0
 
 
@@ -31,17 +33,40 @@ class TushareError(RuntimeError):
     pass
 
 
+def _timeout_setting() -> int:
+    """单次请求超时（秒），从配置取，兜底 120。"""
+    try:
+        return max(10, int(get_setting("tushare_timeout", "120")))
+    except (TypeError, ValueError):
+        return 120
+
+
 def _client():
-    global _pro, _pro_token
+    global _pro, _pro_token, _pro_timeout
     token = get_setting("tushare_token")
     if not token:
         raise TushareError("未配置 tushare token，请到「环境设置」页填写。")
     apply_proxies()
-    if _pro is None or token != _pro_token:
+    to = _timeout_setting()
+    if _pro is None or token != _pro_token or to != _pro_timeout:
         ts.set_token(token)
-        _pro = ts.pro_api()
+        _pro = ts.pro_api(timeout=to)
         _pro_token = token
+        _pro_timeout = to
     return _pro
+
+
+def _call_with_retry(fn, *args, tries: int = 3, **kwargs):
+    """带重试地调用 tushare 接口：全市场查询偶发 read timeout / 连接错误，重试通常即可通过。"""
+    last = None
+    for i in range(tries):
+        try:
+            return fn(*args, **kwargs)
+        except RequestException as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(2 * (i + 1))  # 2s、4s 退避
+    raise last
 
 
 def _rate_limit() -> None:
@@ -207,12 +232,12 @@ def ensure_bars_for_dates(trade_dates: List[str]) -> int:
     pro = _client()
     for d in missing:
         _rate_limit()
-        df = pro.daily(trade_date=d)
+        df = _call_with_retry(pro.daily, trade_date=d)
         if df is None or df.empty:
             continue
         # 整市场复权因子；缺失填 1.0（极个别无因子的票按不复权处理）
         _rate_limit()
-        af = pro.adj_factor(trade_date=d)
+        af = _call_with_retry(pro.adj_factor, trade_date=d)
         if af is not None and not af.empty:
             df = df.merge(af[["ts_code", "adj_factor"]], on="ts_code", how="left")
         else:
